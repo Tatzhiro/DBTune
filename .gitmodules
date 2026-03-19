@@ -4,3 +4,6 @@
 [submodule "third_party/oltpbench"]
 	path = third_party/oltpbench
 	url = https://github.com/oltpbenchmark/oltpbench.git
+[submodule "third_party/sysbench"]
+	path = third_party/sysbench
+	url = https://github.com/akopytov/sysbench.git
