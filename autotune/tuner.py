@@ -1,5 +1,6 @@
 import os
 import sys
+import pickle
 from collections import  defaultdict
 from autotune.utils.config_space import ConfigurationSpace, UniformIntegerHyperparameter, CategoricalHyperparameter, UniformFloatHyperparameter
 from autotune.workload_map import WorkloadMapping
@@ -65,7 +66,21 @@ class DBTuner:
         return config_space
 
     def load_history(self, knob_num):
-        files = os.listdir(self.hc_path)
+        files = [f for f in os.listdir(self.hc_path) if f.endswith('.json')]
+        cache_path = os.path.join(self.hc_path, '_history_cache.pkl')
+
+        # Use cache if it exists and is newer than all JSON files
+        if os.path.exists(cache_path):
+            cache_mtime = os.path.getmtime(cache_path)
+            newest_json = max(os.path.getmtime(os.path.join(self.hc_path, f)) for f in files)
+            if cache_mtime >= newest_json:
+                logger.info('Loading history from cache: {}'.format(cache_path))
+                with open(cache_path, 'rb') as fp:
+                    self.hcL = pickle.load(fp)
+                logger.info('Loaded {} history containers from cache'.format(len(self.hcL)))
+                return
+
+        logger.info('Cache missing or stale, loading {} JSON files...'.format(len(files)))
         config_space = self.setup_configuration_space(self.args_db['knob_config_file'], int(self.args_db['knob_num']))
         for f in files:
             try:
@@ -76,6 +91,11 @@ class DBTuner:
                 self.hcL.append(history_container)
             except:
                 logger.info('load history failed for {}'.format(f))
+
+        logger.info('Saving history cache to {}'.format(cache_path))
+        with open(cache_path, 'wb') as fp:
+            pickle.dump(self.hcL, fp)
+        logger.info('Saved {} history containers to cache'.format(len(self.hcL)))
 
     def setup_transfer(self):
         if self.transfer_framework == 'none':
@@ -97,7 +117,13 @@ class DBTuner:
             if self.transfer_framework == 'rgpe':
                 self.surrogate_type = 'tlbo_rgpe_' + method
             else:
-                self.surrogate_type = 'tlbo_mapping_' + method
+                mapping_method = self.args_tune.get('mapping_method', 'ottertune')
+                if mapping_method == 'ottertune':
+                    prune = self.args_tune.get('mapping_prune_metrics', 'false').lower() == 'true'
+                    prune_str = '_pruned' if prune else ''
+                    self.surrogate_type = f'tlbo_ottertune{prune_str}_{method}'
+                else:
+                    self.surrogate_type = 'tlbo_mapping_' + method
 
         elif self.transfer_framework == 'finetune':
             if self.method != 'DDPG':
@@ -109,6 +135,9 @@ class DBTuner:
             self.surrogate_type = 'context_prf'
             if self.method != 'SMAC':
                 raise ValueError('We currently only support SMAC. Invalid method for context!')
+
+        elif self.transfer_framework == 'dml':
+            self.surrogate_type = None  # DML doesn't use surrogates
 
         else:
             raise ValueError('Invalid string %s for transfer framework!' % self.transfer_framework)
@@ -173,9 +202,17 @@ class DBTuner:
                        hold_out_workload=self.args_db['workload'],
                        history_workload_data=self.history_workload_data,
                        only_knob=eval(self.args_tune['only_knob']),
-                       only_range=eval(self.args_tune['only_range']))
+                       only_range=eval(self.args_tune['only_range']),
+                       dml_model_path=self.args_tune.get('dml_model_path', 'autotune/optimizer/dml_models/context_model.pth'),
+                       dml_context_metrics_path=self.args_tune.get('dml_context_metrics_path', 'autotune/optimizer/dml_models/context_default_metrics_all.csv'),
+                       dml_result_data_dir=self.args_tune.get('dml_result_data_dir', 'DBMSTransferLearning/dataset'),
+                       prometheus_url=self.args_tune.get('prometheus_url', None),
+                       mysql_instance=self.args_tune.get('mysql_instance', None),
+                       node_instance=self.args_tune.get('node_instance', None))
         history = bo.run()
         if history.num_objs == 1:
+            import matplotlib
+            matplotlib.use('Agg')
             import matplotlib.pyplot as plt
             history.plot_convergence()
             plt.savefig('%s.png' % history.task_id)

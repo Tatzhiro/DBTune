@@ -104,9 +104,9 @@ def parse_sysbench(file_path):
         tps /= num_samples
         qps /= num_samples
         latency /= num_samples
-        tps_var = statistics.variance(tpsL)
-        lat_var = statistics.variance(latL)
-        qps_var = statistics.variance(qpsL)
+        tps_var = statistics.variance(tpsL) if len(tpsL) > 1 else 0
+        lat_var = statistics.variance(latL) if len(latL) > 1 else 0
+        qps_var = statistics.variance(qpsL) if len(qpsL) > 1 else 0
         return [tps, latency, qps, tps_var, lat_var, qps_var]
 
     else:
@@ -166,6 +166,23 @@ def parse_oltpbench(file_path):
 
     return [tps, latency, tps, -1, -1, -1]
 
+
+def parse_oltpbench_res(file_path):
+    """Parse OLTPBench .res file (per-second throughput samples) as fallback when .summary is missing."""
+    import csv
+    tps_list = []
+    lat_list = []
+    with open(file_path) as f:
+        reader = csv.reader(f)
+        header = next(reader)  # skip header
+        for row in reader:
+            if len(row) >= 2:
+                tps_list.append(float(row[1]))
+            if len(row) >= 3:
+                lat_list.append(float(row[2]))
+    tps = sum(tps_list) / len(tps_list) if tps_list else 0.0
+    latency = np.percentile(lat_list, 95) if lat_list else -1
+    return [tps, latency, tps, -1, -1, -1]
 
 
 '''

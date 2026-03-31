@@ -10,3 +10,10 @@ train_user_*.py
 *.png
 scripts/log/
 .vscode/
+venv/
+third_party/
+mysql_build/
+*.egg-info/
+__pycache__/
+build/
+results/

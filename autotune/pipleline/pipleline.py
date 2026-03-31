@@ -142,7 +142,8 @@ class PipleLine(BOBase):
                 with open("tools/{}_best_optimizer.pkl".format(hold_out_workload), 'rb') as f:
                     self.best_method_id_list = pickle.load(f)
 
-        self.logger.info("Total space size:{}".format(estimate_size(self.config_space, '/data2/ruike/DBTune/scripts/experiment/gen_knobs/postgres_all.json')))
+        # TODO: knob file needs to be given to Pipeline class
+        # self.logger.info("Total space size:{}".format(estimate_size(self.config_space, '/data2/ruike/DBTune/scripts/experiment/gen_knobs/postgres_all.json')))
         self.iter_begin_time = time.time()
         advisor_kwargs = advisor_kwargs or {}
         # init history container
@@ -211,6 +212,21 @@ class PipleLine(BOBase):
                                                 batch_size=kwargs['batch_size'],
                                                 mean_var_file=kwargs['mean_var_file']
                                                 )
+            elif optimizer_type == 'DML':
+                assert self.num_objs == 1 and num_constraints == 0
+                assert self.incremental == 'none'
+                from autotune.optimizer.dml_optimizer import DML_Optimizer
+                self.optimizer = DML_Optimizer(
+                    config_space,
+                    self.history_container,
+                    model_path=kwargs.get('dml_model_path', 'autotune/optimizer/dml_models/context_model.pth'),
+                    context_metrics_path=kwargs.get('dml_context_metrics_path', 'autotune/optimizer/dml_models/context_default_metrics_all.csv'),
+                    result_data_dir=kwargs.get('dml_result_data_dir', 'DBMSTransferLearning/dataset'),
+                    knob_config_file=knob_config_file,
+                    prometheus_url=kwargs.get('prometheus_url'),
+                    mysql_instance=kwargs.get('mysql_instance'),
+                    node_instance=kwargs.get('node_instance'),
+                )
             else:
                 raise ValueError('Invalid advisor type!')
         else:
@@ -456,6 +472,16 @@ class PipleLine(BOBase):
             config = self.initial_configurations[len(self.history_container.configurations)]
         else:
             config = self.optimizer.get_suggestion(history_container=self.history_container, compact_space=compact_space)
+
+        # Capture matched context from optimizer or surrogate (DML, workload_map, etc.)
+        matched = None
+        if hasattr(self.optimizer, 'matched_context_id') and self.optimizer.matched_context_id:
+            matched = self.optimizer.matched_context_id
+        elif hasattr(self.optimizer, 'surrogate_model') and hasattr(self.optimizer.surrogate_model, 'matched_context_id'):
+            matched = self.optimizer.surrogate_model.matched_context_id
+        if matched:
+            self.current_context = {'matched_context': matched}
+
         if self.space_transfer:
             if len(self.history_container.get_incumbents()):
                 config = impute_incumb_values(config, self.history_container.get_incumbents()[0][0])

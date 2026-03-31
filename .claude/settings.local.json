@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Bash(curl -s 'http://localhost:9090/api/v1/query?query=mysql_global_status_queries')",
+      "Bash(python3 -m json.tool)"
+    ],
+    "deny": [
+      "Bash(rm *)"
+    ]
+  }
+}

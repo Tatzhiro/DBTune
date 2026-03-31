@@ -7,6 +7,7 @@ import paramiko
 import logging
 import numpy as np
 import multiprocessing as mp
+from shutil import copyfile
 from getpass import getpass
 from autotune.dbconnector import MysqlConnector
 from autotune.knobs import logger
@@ -36,6 +37,25 @@ class MysqlDB:
         self.dbname = args['dbname']
         self.sock = args['sock']
         self.pid = int(args['pid'])
+        # If pid is 0 (online mode), try to detect from pid-file or process list
+        if self.pid == 0:
+            pid_file = args.get('sock', '').replace('.sock', '.pid')
+            if pid_file and os.path.exists(pid_file):
+                try:
+                    with open(pid_file) as f:
+                        self.pid = int(f.read().strip())
+                except Exception:
+                    pass
+            if self.pid == 0:
+                try:
+                    import subprocess
+                    result = subprocess.run(['pgrep', '-f', args.get('mysqld', 'mysqld')],
+                                          capture_output=True, text=True)
+                    pids = result.stdout.strip().split('\n')
+                    if pids and pids[0]:
+                        self.pid = int(pids[0])
+                except Exception:
+                    pass
         self.mycnf = args['cnf']
         self.mysqld = args['mysqld']
 
@@ -76,7 +96,18 @@ class MysqlDB:
 
         self.clear_cmd = """mysqladmin processlist -uroot -S$MYSQL_SOCK | awk '$2 ~ /^[0-9]/ {print "KILL "$2";"}' | mysql -uroot -S$MYSQL_SOCK """
 
+        # Save a clean copy of my.cnf so we can restore it before each config write
+        self.mycnf_clean = self.mycnf + '.clean'
+        if not os.path.exists(self.mycnf_clean):
+            copyfile(self.mycnf, self.mycnf_clean)
+            logger.info("Saved clean cnf backup: %s", self.mycnf_clean)
+
     def _gen_config_file(self, knobs):
+        # Restore clean cnf before writing new knobs to avoid stale values
+        if os.path.exists(self.mycnf_clean):
+            copyfile(self.mycnf_clean, self.mycnf)
+            logger.info("Restored clean cnf from %s", self.mycnf_clean)
+
         if self.remote_mode:
             cnf = '/tmp/mylocal.cnf'
             ssh = paramiko.SSHClient()
@@ -100,8 +131,8 @@ class MysqlDB:
                 knobs_not_in_cnf.append(key)
                 continue
             cnf_parser.set(key, knobs[key])
-
-        cnf_parser.replace('/data2/ruike/tmpdir/mysql.cnf')
+    
+        cnf_parser.replace('./tmp/mysqld.cnf')
 
         if self.remote_mode:
             ssh = paramiko.SSHClient()
@@ -327,7 +358,7 @@ class MysqlDB:
             except:
                 v0 = r[0]['Value'].strip()
 
-        if v0 == v:
+        if str(v0) == str(v):
             return True
 
         if str(v).isdigit():
@@ -337,10 +368,16 @@ class MysqlDB:
         try:
             db_conn.execute(sql)
         except:
-            logger.info("Failed: execute {}".format(sql))
+            logger.info("Failed: execute {} (read-only variable?)".format(sql))
+            return True  # Skip waiting for read-only variables
 
+        count = 0
         while not self._check_apply(db_conn, k, v0):
             time.sleep(1)
+            count += 1
+            if count > 30:
+                logger.info("Timeout waiting for {} to apply".format(k))
+                break
         return True
 
     def im_alive_init(self):
@@ -397,8 +434,8 @@ class MysqlDB:
             else:
                 return float(sum(metric_values)) / len(metric_values)
 
-        result = np.zeros(65)
         keys = list(metrics[0].keys())
+        result = np.zeros(len(keys))
         keys.sort()
         total_pages = 0
         dirty_pages = 0
