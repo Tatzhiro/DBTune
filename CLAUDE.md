@@ -155,5 +155,16 @@ To add a new optimization method:
 - Knob values exceeding `sys.maxsize` are scaled by 1000 (e.g., `innodb_buffer_pool_size`)
 - The `pipleline` directory name is a typo (should be "pipeline") - preserved for compatibility
 
+## DML Model Training Data
+The DML (Deep Metric Learning) optimizer uses a triplet embedding model trained on the `DBMSTransferLearning` dataset. Training inputs:
+- **Triplet data**: `DBMSTransferLearning/dataset/full_triplet_data_concordance.csv` — generates (anchor, positive, negative) triplets from historical tuning runs on different hardware/workloads
+- **Context metrics**: `DBMSTransferLearning/dataset/context_default_metrics_all.csv` — 11 DBMS/OS metrics (memory usage, InnoDB hit rate, dirty pages, QPS, CPU, row ops, disk IOPS) collected at the **default configuration** for each `{hardware}_{workload}` context
+- **Training script**: `scripts/train_dml_model.py`
+- **Input dim**: 11 features → 64 → 32 → 16-dim embedding (L2 normalized)
+- **Outputs**: `context_model.pth`, `scaler.pkl` (MinMaxScaler), and a copy of the context metrics CSV
+
+To train a model that excludes a specific workload (for "unseen workload" evaluation), filter both CSVs before running `train_dml_model.py` and point `--output_dir` to `autotune/optimizer/dml_models_no_{workload}/`. See `.claude/skills/run-experiment.md` for details.
+
 ## Known Performance Issues
-- Tuning iterations with sysbench RW can take ~10 minutes. Changing `innodb_log_file_size` (e.g. 5GB -> 48MB) was hypothesized as the cause but **disproven**: a standalone test (`scripts/test_restart_slowdown.sh`) showed the 5GB->48MB restart adds only ~33s (30s shutdown + 3s startup), far less than the observed ~10min delays. The real bottleneck is elsewhere.
+- **MySQL slow restart after force kill is likely a disk I/O bottleneck.** In controlled tests, graceful shutdown + restart takes ~26-30s for any config (including 5GB redo logs). But in real tuning runs, InnoDB crash recovery after `kill -9` can take **60-120s** for the same data and configs. Test data: standalone `scripts/test_restart_slowdown.sh` shows ~30s; real runs consistently show 60-120s. The server hosts Elasticsearch (128GB heap) and other processes competing for disk — this is the suspected cause, though not definitively proven. Increasing `TIMEOUT_CLOSE` in `mysqldb.py` to allow graceful shutdown (rather than force kill) avoids crash recovery and is faster.
+- Tuning iterations with sysbench RW can take ~10 minutes. Changing `innodb_log_file_size` (e.g. 5GB -> 48MB) was hypothesized as the cause but **disproven**: a standalone test (`scripts/test_restart_slowdown.sh`) showed the 5GB->48MB restart adds only ~33s (30s shutdown + 3s startup), far less than the observed ~10min delays. The real bottleneck is likely disk I/O contention as described above.
