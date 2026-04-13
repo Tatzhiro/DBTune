@@ -181,8 +181,8 @@ class DBEnv:
                                               self.db.host,
                                               self.db.port,
                                               self.db.user,
-                                              150,
-                                              800000,
+                                              int(self.args.get('sysbench_tables', 64)),
+                                              int(self.args.get('sysbench_table_size', 100000)),
                                               BENCHMARK_WARMING_TIME,
                                               self.threads,
                                               BENCHMARK_RUNNING_TIME,
@@ -321,7 +321,7 @@ class DBEnv:
                 logger.info('db reinitialized')
         self.step_count = self.step_count + 1
         self.reinit_interval = self.reinit_interval + 1
-
+        
         # modify and apply knobs
         for key in knobs.keys():
             value = knobs[key]
@@ -340,6 +340,10 @@ class DBEnv:
             flag = self.db.apply_knobs_online(knobs)
         else:
             flag = self.db.apply_knobs_offline(knobs)
+
+        # After first iteration applies knobs, verify they took effect
+        if self.step_count == 1:
+            self.db.ensure_default_config()
 
         if not flag:
             if self.reinit:

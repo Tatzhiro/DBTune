@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
-# Test hypothesis: changing innodb_log_file_size from 5GB -> 48MB causes slow MySQL restart
+# Test: MySQL restart time — matches real DBTune _kill_mysqld behavior
+# Tests 3 scenarios after a 15s benchmark with default config (48MB redo, 1GB buf):
+#   A) Immediate kill -9
+#   B) 60s partial graceful shutdown + kill -9 (what DBTune does when TIMEOUT_CLOSE=60)
+#   C) Full graceful shutdown (baseline)
+#
+# Restart config uses real OtterTune iteration 2 knobs.
 #
 set -euo pipefail
 
@@ -12,11 +18,10 @@ CNF="$MYSQL_BASE/cnf/my.cnf"
 CNF_CLEAN="$MYSQL_BASE/cnf/my.cnf.clean"
 CLIENT_CNF="$MYSQL_BASE/cnf/mysql_client.cnf"
 SOCK="$MYSQL_BASE/mysql.sock"
-PIDFILE="$MYSQL_BASE/mysql.pid"
-TIMEOUT=300
+ERRLOG="$MYSQL_BASE/mysql.err"
+TIMEOUT=1800
 
-LOG_5GB=5368709120
-LOG_48MB=50331648
+SYSBENCH_BIN="${SYSBENCH_BIN:-/usr/local/bin/sysbench}"
 
 wait_for_mysql() {
     local elapsed=0
@@ -24,112 +29,222 @@ wait_for_mysql() {
         sleep 1
         elapsed=$((elapsed + 1))
         if [ "$elapsed" -ge "$TIMEOUT" ]; then
-            echo "ERROR: MySQL did not start within ${TIMEOUT}s"
+            echo "    ERROR: MySQL did not start within ${TIMEOUT}s"
+            tail -5 "$ERRLOG"
             exit 1
         fi
+        if [ $((elapsed % 30)) -eq 0 ]; then
+            echo "    ...waiting (${elapsed}s)"
+        fi
+    done
+    echo "    connected after ${elapsed}s"
+}
+
+kill_all_mysqld() {
+    for pid in $(pgrep -x mysqld 2>/dev/null || true); do
+        kill -9 "$pid" 2>/dev/null && echo "    killed mysqld pid=$pid" || true
+    done
+    while pgrep -x mysqld &>/dev/null; do sleep 0.5; done
+    while ss -tlnp | grep -q ':3306 ' 2>/dev/null; do sleep 1; done
+    rm -f "$SOCK" "$SOCK.lock"
+}
+
+write_cnf_default() {
+    # Match DBTune iteration 1: clean cnf + default knobs from DML_12.json
+    cp "$CNF_CLEAN" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_adaptive_hash_index\t\t= 1" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_buffer_pool_instances\t\t= 1" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_buffer_pool_size\t\t= 1073741824" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_change_buffer_max_size\t\t= 25" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_flush_log_at_trx_commit\t\t= 1" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_io_capacity\t\t= 100" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_log_file_size\t\t= 50331648" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_lru_scan_depth\t\t= 1024" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_read_io_threads\t\t= 2" "$CNF"
+    sed -i "/^\[mysqld\]/a innodb_write_io_threads\t\t= 2" "$CNF"
+    sed -i "/^\[mysqld\]/a sync_binlog\t\t= 1" "$CNF"
+    sed -i "/^\[mysqld\]/a table_open_cache\t\t= 4000" "$CNF"
+}
+
+write_cnf_all_knobs() {
+    # Write all 12 knobs to cnf
+    local knobs="$1"
+    cp "$CNF_CLEAN" "$CNF"
+    for kv in $knobs; do
+        local key="${kv%%=*}"
+        local val="${kv#*=}"
+        sed -i "/^\[mysqld\]/a ${key}\t\t= ${val}" "$CNF"
     done
 }
 
-shutdown_mysql() {
-    if "$MYSQLADMIN" --socket="$SOCK" -u root ping &>/dev/null; then
-        "$MYSQLADMIN" --socket="$SOCK" -u root shutdown
-        # Wait for process to exit
-        while [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; do
-            sleep 0.5
-        done
-    fi
+run_benchmark() {
+    echo "  Running sysbench oltp_read_write (5s warmup + 15s run, 32 threads)..."
+    "$SYSBENCH_BIN" oltp_read_write \
+        --mysql-host=localhost \
+        --mysql-socket="$SOCK" \
+        --mysql-user=root \
+        --mysql-password="" \
+        --mysql-db=sbtest \
+        --db-driver=mysql \
+        --mysql-storage-engine=innodb \
+        --range-size=100 \
+        --events=0 \
+        --rand-type=uniform \
+        --tables=64 \
+        --table-size=100000 \
+        --db-ps-mode=disable \
+        --warmup-time=5 \
+        --threads=32 \
+        --time=15 \
+        run 2>&1 | grep "transactions:"
 }
 
-write_cnf() {
-    local log_file_size=$1
-    cp "$CNF_CLEAN" "$CNF"
-    # Append the log file size setting before the [client] section or at end of [mysqld]
-    sed -i "/^\[mysqld\]/a innodb_log_file_size\t\t= $log_file_size" "$CNF"
+log_dirty_pages() {
+    local dirty=$("$MYSQL_CLI" --defaults-file="$CLIENT_CNF" -u root -N -e \
+        "SELECT variable_value FROM performance_schema.global_status WHERE variable_name='Innodb_buffer_pool_pages_dirty'" 2>/dev/null || echo "N/A")
+    echo "  Dirty pages: $dirty"
 }
 
-start_mysql() {
+# Real OtterTune iteration 2 knobs (from a run that took 65s)
+RESTART_KNOBS="innodb_adaptive_hash_index=0 innodb_buffer_pool_instances=4 innodb_buffer_pool_size=8974511804 innodb_change_buffer_max_size=9 innodb_flush_log_at_trx_commit=1 innodb_io_capacity=2665 innodb_log_file_size=1299599738 innodb_lru_scan_depth=2213 innodb_read_io_threads=11 innodb_write_io_threads=9 sync_binlog=0 table_open_cache=490"
+
+echo "================================================================"
+echo " MySQL restart time test (matching DBTune behavior)"
+echo "================================================================"
+echo ""
+echo "Default config: 48MB redo, 1GB buffer pool"
+echo "Restart config: $RESTART_KNOBS"
+echo ""
+
+# --- Setup function: start default MySQL, run benchmark ---
+setup_and_benchmark() {
+    kill_all_mysqld
+    write_cnf_default
     "$MYSQLD" --defaults-file="$CNF" &
     wait_for_mysql
+    run_benchmark
+    log_dirty_pages
 }
 
+# =============================================
+# TEST A: Immediate kill -9 after benchmark
+# =============================================
 echo "============================================"
-echo " innodb_log_file_size restart slowdown test"
+echo " TEST A: Immediate kill -9 after benchmark"
 echo "============================================"
-echo ""
 
-# --- Step 1: Start MySQL with 5GB log file size ---
-echo "Step 1: Starting MySQL with innodb_log_file_size = 5GB..."
-shutdown_mysql
-write_cnf $LOG_5GB
-start_mysql
+setup_and_benchmark
 
-actual=$("$MYSQL_CLI" --defaults-file="$CLIENT_CNF" -u root -N -e "SELECT @@innodb_log_file_size")
-echo "  Verified innodb_log_file_size = $actual"
-if [ "$actual" != "$LOG_5GB" ]; then
-    echo "  WARNING: expected $LOG_5GB, got $actual"
-fi
-echo ""
+echo "  Force killing immediately..."
+T_KILL=$(date +%s.%N)
+kill_all_mysqld
+T_KILLED=$(date +%s.%N)
 
-# --- Step 2: Run sysbench RW ---
-echo "Step 2: Running sysbench oltp_read_write (5s warmup + 15s run)..."
-sysbench oltp_read_write \
-    --mysql-host=localhost \
-    --mysql-socket="$SOCK" \
-    --mysql-user=root \
-    --mysql-password="" \
-    --mysql-db=sbtest \
-    --db-driver=mysql \
-    --mysql-storage-engine=innodb \
-    --range-size=100 \
-    --events=0 \
-    --rand-type=uniform \
-    --tables=150 \
-    --table-size=800000 \
-    --db-ps-mode=disable \
-    --warmup-time=5 \
-    --threads=32 \
-    --time=15 \
-    run 2>&1 | tail -5
-echo ""
-
-# --- Step 3: Change to 48MB and measure restart ---
-echo "Step 3: Changing innodb_log_file_size to 48MB and restarting..."
-write_cnf $LOG_48MB
-
-T_start=$(date +%s.%N)
-
-echo "  Shutting down MySQL..."
-"$MYSQLADMIN" --socket="$SOCK" -u root shutdown
-while [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; do
-    sleep 0.5
-done
-
-T_after_shutdown=$(date +%s.%N)
-
-echo "  Starting MySQL with 48MB log file size..."
+echo "  Restarting with OtterTune knobs..."
+write_cnf_all_knobs "$RESTART_KNOBS"
+T_START=$(date +%s.%N)
 "$MYSQLD" --defaults-file="$CNF" &
 wait_for_mysql
+T_READY=$(date +%s.%N)
 
-T_after_start=$(date +%s.%N)
+A_KILL=$(python3 -c "print(f'{$T_KILLED - $T_KILL:.1f}')")
+A_STARTUP=$(python3 -c "print(f'{$T_READY - $T_START:.1f}')")
+A_TOTAL=$(python3 -c "print(f'{$T_READY - $T_KILL:.1f}')")
+echo ""
+echo "  [TEST A] kill=${A_KILL}s  startup=${A_STARTUP}s  total=${A_TOTAL}s"
 
-actual=$("$MYSQL_CLI" --defaults-file="$CLIENT_CNF" -u root -N -e "SELECT @@innodb_log_file_size")
-echo "  Verified innodb_log_file_size = $actual"
+# Clean shutdown before next test
+"$MYSQLADMIN" --socket="$SOCK" -u root shutdown
+while pgrep -x mysqld &>/dev/null; do sleep 0.5; done
+
+# =============================================
+# TEST B: 60s partial graceful + kill -9
+#         (what DBTune _kill_mysqld does)
+# =============================================
+echo ""
+echo "============================================"
+echo " TEST B: 60s partial graceful + kill -9"
+echo "         (simulates DBTune TIMEOUT_CLOSE=60)"
+echo "============================================"
+
+setup_and_benchmark
+
+echo "  Starting mysqladmin shutdown..."
+T_SHUTDOWN=$(date +%s.%N)
+"$MYSQLADMIN" --socket="$SOCK" -u root shutdown &
+ADMIN_PID=$!
+echo "  Waiting 60s for partial flush..."
+sleep 60
+echo "  Force killing after 60s..."
+T_KILL=$(date +%s.%N)
+kill_all_mysqld
+# Also kill mysqladmin if still running
+kill $ADMIN_PID 2>/dev/null || true
+T_KILLED=$(date +%s.%N)
+
+echo "  Restarting with OtterTune knobs..."
+write_cnf_all_knobs "$RESTART_KNOBS"
+T_START=$(date +%s.%N)
+"$MYSQLD" --defaults-file="$CNF" &
+wait_for_mysql
+T_READY=$(date +%s.%N)
+
+B_GRACEFUL=$(python3 -c "print(f'{$T_KILL - $T_SHUTDOWN:.1f}')")
+B_KILL=$(python3 -c "print(f'{$T_KILLED - $T_KILL:.1f}')")
+B_STARTUP=$(python3 -c "print(f'{$T_READY - $T_START:.1f}')")
+B_TOTAL=$(python3 -c "print(f'{$T_READY - $T_SHUTDOWN:.1f}')")
+echo ""
+echo "  [TEST B] graceful_wait=${B_GRACEFUL}s  kill=${B_KILL}s  startup=${B_STARTUP}s  total=${B_TOTAL}s"
+
+# Clean shutdown before next test
+"$MYSQLADMIN" --socket="$SOCK" -u root shutdown
+while pgrep -x mysqld &>/dev/null; do sleep 0.5; done
+
+# =============================================
+# TEST C: Full graceful shutdown (baseline)
+# =============================================
+echo ""
+echo "============================================"
+echo " TEST C: Full graceful shutdown (baseline)"
+echo "============================================"
+
+setup_and_benchmark
+
+echo "  Graceful shutdown..."
+T_SHUTDOWN=$(date +%s.%N)
+"$MYSQLADMIN" --socket="$SOCK" -u root shutdown
+while pgrep -x mysqld &>/dev/null; do sleep 0.5; done
+T_DOWN=$(date +%s.%N)
+
+echo "  Restarting with OtterTune knobs..."
+write_cnf_all_knobs "$RESTART_KNOBS"
+T_START=$(date +%s.%N)
+"$MYSQLD" --defaults-file="$CNF" &
+wait_for_mysql
+T_READY=$(date +%s.%N)
+
+C_SHUTDOWN=$(python3 -c "print(f'{$T_DOWN - $T_SHUTDOWN:.1f}')")
+C_STARTUP=$(python3 -c "print(f'{$T_READY - $T_START:.1f}')")
+C_TOTAL=$(python3 -c "print(f'{$T_READY - $T_SHUTDOWN:.1f}')")
+echo ""
+echo "  [TEST C] shutdown=${C_SHUTDOWN}s  startup=${C_STARTUP}s  total=${C_TOTAL}s"
+
+# =============================================
+# SUMMARY
+# =============================================
+echo ""
+echo "============================================"
+echo " SUMMARY"
+echo "============================================"
+echo ""
+echo "  A) Immediate kill -9:           kill=${A_KILL}s + startup=${A_STARTUP}s = ${A_TOTAL}s"
+echo "  B) 60s graceful + kill -9:      wait=${B_GRACEFUL}s + kill=${B_KILL}s + startup=${B_STARTUP}s = ${B_TOTAL}s"
+echo "  C) Full graceful shutdown:      shutdown=${C_SHUTDOWN}s + startup=${C_STARTUP}s = ${C_TOTAL}s"
 echo ""
 
-# --- Results ---
-echo "============================================"
-echo " Results (5GB -> 48MB restart)"
-echo "============================================"
-python3 -c "
-s, m, e = $T_start, $T_after_shutdown, $T_after_start
-print(f'Shutdown time: {m-s:6.2f} seconds')
-print(f'Startup time:  {e-m:6.2f} seconds')
-print(f'Total time:    {e-s:6.2f} seconds')
-"
-echo "============================================"
-
-# --- Step 4: Restore clean config ---
+# --- Restore ---
+kill_all_mysqld
 cp "$CNF_CLEAN" "$CNF"
-echo ""
-echo "Restored my.cnf to clean config."
-echo "MySQL is still running with 48MB log file size."
+"$MYSQLD" --defaults-file="$CNF" &
+wait_for_mysql
+echo "Restored clean config. MySQL running."

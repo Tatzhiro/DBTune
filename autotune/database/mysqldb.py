@@ -151,6 +151,7 @@ class MysqlDB:
         return knobs_not_in_cnf
 
     def _kill_mysqld(self):
+        kill_start = time.time()
         mysqladmin = os.path.dirname(self.mysqld) + '/mysqladmin'
         kill_cmd = '{} -u{} -S {} shutdown'.format(mysqladmin, self.user, self.sock)
         force_kill_cmd1 = "ps aux|grep '" + self.sock + "'|awk '{print $2}'|xargs kill -9"
@@ -170,23 +171,40 @@ class MysqlDB:
                 ssh.exec_command(force_kill_cmd1)
                 ssh.exec_command(force_kill_cmd2)
             ssh.close()
-            logger.info('mysql is shut down remotely')
+            logger.info('mysql is shut down remotely (%.1fs)', time.time() - kill_start)
 
         else:
-            p_close = subprocess.Popen(kill_cmd, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE,
-                                       close_fds=True)
-            try:
-                outs, errs = p_close.communicate(timeout=TIMEOUT_CLOSE)
-                ret_code = p_close.poll()
-                if ret_code == 0:
-                    logger.info("Close db successfully")
-            except subprocess.TimeoutExpired:
-                logger.info("Force close!")
-                os.system(force_kill_cmd1)
-                os.system(force_kill_cmd2)
-            logger.info('mysql is shut down')
+            # p_close = subprocess.Popen(kill_cmd, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE,
+            #                            close_fds=True)
+            # try:
+            #     outs, errs = p_close.communicate(timeout=TIMEOUT_CLOSE)
+            #     ret_code = p_close.poll()
+            #     if ret_code == 0:
+            #         logger.info("Close db successfully (graceful, %.1fs)", time.time() - kill_start)
+            # except subprocess.TimeoutExpired:
+            logger.info("Force close! (timeout after %ds, elapsed %.1fs)", TIMEOUT_CLOSE, time.time() - kill_start)
+            result = subprocess.run(['pgrep', '-x', 'mysqld'], capture_output=True, text=True)
+            if result.stdout:
+                for pid in result.stdout.strip().split('\n'):
+                    subprocess.run(['kill', '-9', pid], capture_output=True, text=True)
+                    logger.info("Killed mysqld pid=%s", pid)
+            # Remove stale socket and lock files so new mysqld can bind
+            for f in [self.sock, self.sock + '.lock']:
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                        logger.info("Removed stale %s", f)
+                except PermissionError:
+                    logger.warning("Cannot remove %s (permission denied)", f)
+            # Wait for port to be released
+            while subprocess.run(['ss', '-tlnp'], capture_output=True, text=True).stdout.find(':3306 ') >= 0:
+                time.sleep(0.5)
+            assert subprocess.run(['pgrep', '-x', 'mysqld_exporter'], capture_output=True).returncode == 0, \
+                "mysqld_exporter was killed! Check pgrep -x matching."
+            logger.info('mysql is shut down (total %.1fs)', time.time() - kill_start)
 
     def _start_mysqld(self):
+        start_time = time.time()
         if self.remote_mode:
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -213,6 +231,7 @@ class MysqlDB:
         else:
             proc = subprocess.Popen([self.mysqld, '--defaults-file={}'.format(self.mycnf)])
             self.pid = proc.pid
+            logger.info('launched mysqld pid=%d (%.1fs after start)', self.pid, time.time() - start_time)
             if self.isolation_mode:
                 command = 'sudo cgclassify -g memory,cpuset:server ' + str(self.pid)
                 p = os.system(command)
@@ -234,20 +253,26 @@ class MysqlDB:
                     db_conn.close()
                     break
             except Exception as result:
-                if count > 30:
+                if count > 30 and count % 30 == 0:
                     logger.info(result)
+                # Check if mysqld process is still alive
+                if not self.remote_mode and proc.poll() is not None:
+                    logger.error('mysqld process (pid=%d) died with exit code %d after %.1fs',
+                                 self.pid, proc.returncode, time.time() - start_time)
+                    start_sucess = False
+                    break
                 pass
 
             time.sleep(1)
             count = count + 1
             if count > 600:
                 start_sucess = False
-                logger.info("can not connect to DB")
+                logger.info("can not connect to DB after 600s (%.1fs total)", time.time() - start_time)
                 break
 
-        logger.info('finish {} seconds waiting for connection'.format(count))
+        logger.info('finish %d seconds waiting for connection (%.1fs total)', count, time.time() - start_time)
         logger.info('{} --defaults-file={}'.format(self.mysqld, self.mycnf))
-        logger.info('mysql is up')
+        logger.info('mysql is up' if start_sucess else 'mysql FAILED to start')
         return start_sucess
 
     def reinitdb_magic(self):
@@ -261,6 +286,55 @@ class MysqlDB:
         self.pre_combine_log_file_size = log_num_default * log_size_default
         self.apply_knobs_offline(self.default_knobs)
         self.reinit_interval = 0
+
+    def ensure_default_config(self, strong=True):
+        """Verify MySQL is running with default knobs.
+
+        If strong=True, raise an error if any knob differs from default.
+        If strong=False, restart MySQL with defaults if any knob differs.
+        """
+        try:
+            db_conn = MysqlConnector(**self.connection_info)
+            mismatches = []
+            for knob_name, detail in self.knobs_detail.items():
+                sql = 'SHOW GLOBAL VARIABLES LIKE "{}";'.format(knob_name)
+                result = db_conn.fetch_results(sql)
+                if result:
+                    current = str(result[0]['Value']).strip()
+                    expected = str(detail['default'])
+                    # Normalize MySQL boolean display (ON/OFF) to 1/0
+                    normalize = {'ON': '1', 'OFF': '0'}
+                    current_norm = normalize.get(current, current)
+                    expected_norm = normalize.get(expected, expected)
+                    if current_norm != expected_norm:
+                        mismatches.append((knob_name, current, expected))
+            db_conn.close_db()
+
+            if not mismatches:
+                logger.info("All knobs at default values")
+                return
+
+            for knob_name, current, expected in mismatches:
+                logger.error("Knob {} is {}, expected default {}".format(knob_name, current, expected))
+
+            if strong:
+                raise RuntimeError(
+                    "MySQL is not running with default config. {} knob(s) differ: {}".format(
+                        len(mismatches),
+                        ", ".join("{}={} (expected {})".format(k, c, e) for k, c, e in mismatches)))
+            else:
+                logger.info("Restarting MySQL with default knobs")
+                self.apply_knobs_offline(self.default_knobs)
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning("Cannot verify config: {}".format(e))
+            if strong:
+                raise
+            else:
+                self.apply_knobs_offline(self.default_knobs)
+            self.apply_knobs_offline(self.default_knobs)
 
     def apply_knobs_online(self, knobs):
         db_conn = MysqlConnector(**self.connection_info)
