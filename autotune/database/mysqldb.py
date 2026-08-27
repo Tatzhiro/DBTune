@@ -461,18 +461,22 @@ class MysqlDB:
 
         return sucess
 
+    @staticmethod
+    def _norm(value):
+        """Canonical form for comparing knob values: ON/OFF -> 1/0, numbers -> str, text -> lower."""
+        text = str(value).strip()
+        if text.upper() == 'ON':
+            return '1'
+        if text.upper() == 'OFF':
+            return '0'
+        return text.lower()
+
     def _check_apply(self, db_conn, k, v0):
+        """True once the variable no longer reads as its previous value v0 (case-insensitive:
+        MySQL reports enum values in its own case, e.g. FULL vs full)."""
         sql = 'SHOW GLOBAL VARIABLES LIKE "{}";'.format(k)
         r = db_conn.fetch_results(sql)
-        if r[0]['Value'] == 'ON':
-            vv = 1
-        elif r[0]['Value'] == 'OFF':
-            vv = 0
-        else:
-            vv = r[0]['Value'].strip()
-        if vv == v0:
-            return False
-        return True
+        return self._norm(r[0]['Value']) != self._norm(v0)
 
     def set_knob_value(self, db_conn, k, v):
         sql = 'SHOW GLOBAL VARIABLES LIKE "{}";'.format(k)
@@ -493,8 +497,8 @@ class MysqlDB:
             except:
                 v0 = r[0]['Value'].strip()
 
-        if str(v0) == str(v):
-            return True
+        if self._norm(v0) == self._norm(v):
+            return True   # already at the requested value (case-insensitive)
 
         if str(v).isdigit():
             sql = "SET GLOBAL {}={}".format(k, v)

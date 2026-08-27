@@ -179,14 +179,6 @@
         "scope": "Global",
         "type": "enum"
     },
-    "innodb_commit_concurrency": {
-        "default": 0,
-        "dynamic": "Yes",
-        "max": 1000,
-        "min": 0,
-        "scope": "Global",
-        "type": "integer"
-    },
     "innodb_compression_failure_threshold_pct": {
         "default": 5,
         "dynamic": "Yes",
@@ -821,6 +813,14 @@
         "max": 131072,
         "min": 1024,
         "scope": "Global, Session",
+        "type": "integer"
+    },
+    "innodb_redo_log_capacity": {
+        "default": 104857600,
+        "dynamic": "Yes",
+        "max": 8589934592,
+        "min": 104857600,
+        "scope": "Global",
         "type": "integer"
     }
 }
