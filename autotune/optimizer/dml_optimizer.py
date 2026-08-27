@@ -7,7 +7,10 @@ configuration from that context.
 
 Flow:
   Iteration 0: Run default config to collect baseline metrics
-  Iteration 1: Use model to find nearest context, return its best config
+  Iteration 1: Use model to find nearest context, then train a GP on that
+               context's (config -> TPS) data and recommend the config with the
+               highest GP-predicted TPS (NOT restricted to configs that were
+               actually tried in the source context).
   Iteration 2+: Random sampling (placeholder for future iterative algorithm)
 """
 import os
@@ -20,6 +23,8 @@ import torch
 import torch.nn as nn
 import joblib
 from scipy.spatial.distance import cdist
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, ConstantKernel, WhiteKernel
 from ConfigSpace import Configuration
 
 from autotune.optimizer.dml_metrics import (
@@ -90,6 +95,9 @@ class DML_Optimizer:
         self.node_instance = node_instance
         self.matched_context_id = None
         self.transferred_config = None
+        # GP recommender config (iter 1 over the matched context's data)
+        self.gp_max_train = int(kwargs.get('dml_gp_max_train', 600))
+        self.gp_n_candidates = int(kwargs.get('dml_gp_n_candidates', 30000))
 
         # Load knob config for sys.maxsize scaling info
         self.knob_scaling = {}
@@ -129,12 +137,20 @@ class DML_Optimizer:
             ).numpy()
         logger.info("Pre-computed embeddings for %d reference contexts", len(self.context_ids))
 
-        # Load result CSVs and find best config per context
+        # Load result CSVs: best config per context AND all (config, TPS) rows
+        # per context (the latter is the GP training data for iter 1).
+        self.context_rows = {}
         self.best_configs = self._load_best_configs(result_data_dir)
-        logger.info("Loaded best configs for %d contexts", len(self.best_configs))
+        logger.info("Loaded best configs for %d contexts; GP training data for %d contexts",
+                    len(self.best_configs), len(self.context_rows))
 
     def _load_best_configs(self, result_data_dir):
-        """Load all result CSVs and find the best config (by TPS) per context_id."""
+        """Load all result CSVs and find the best config (by TPS) per context_id.
+
+        Also populates self.context_rows[context_id] = {'knobs': (n,k) array,
+        'cols': [knob names], 'tps': (n,) array} with every tried row, used to
+        train a per-context GP at recommendation time.
+        """
         best_configs = {}
         csv_files = [f for f in os.listdir(result_data_dir) if f.endswith('-result.csv')]
 
@@ -151,6 +167,7 @@ class DML_Optimizer:
 
             # Hardware ID from filename (e.g., '8c12g' from '8c12g-result.csv')
             hw_id = csv_file.replace('-result.csv', '')
+            present_params = [p for p in CONFIG_PARAMS if p in df.columns]
 
             # Group by workload and find best config per context
             for wl, group in df.groupby('workload_label'):
@@ -168,7 +185,171 @@ class DML_Optimizer:
                     'tps': best_row['tps'],
                 }
 
+                # Store all rows for GP training (vectorized — cheap)
+                self.context_rows[context_id] = {
+                    'knobs': group[present_params].to_numpy(dtype=float),
+                    'cols': present_params,
+                    'tps': group['tps'].to_numpy(dtype=float),
+                }
+
         return best_configs
+
+    def _recommend_via_gp(self, context_id):
+        """Train a GP on the matched context's (config -> TPS) data and return
+        the candidate configuration with the highest GP-predicted TPS.
+
+        Returns (Configuration, predicted_tps) or (None, None) to signal the
+        caller to fall back to the best-tried config.
+        """
+        data = self.context_rows.get(context_id)
+        if not data or len(data['tps']) < 5:
+            return None, None
+
+        knobs_mat, cols, tps = data['knobs'], data['cols'], data['tps']
+        n = len(tps)
+
+        # Subsample for tractable GP fit: keep the top-half by TPS (so the GP
+        # sees the high-performing region) plus a random sample of the rest.
+        rng = np.random.RandomState(0)
+        if n > self.gp_max_train:
+            order = np.argsort(tps)[::-1]
+            n_top = self.gp_max_train // 2
+            top = order[:n_top]
+            rest_pool = order[n_top:]
+            n_rand = self.gp_max_train - n_top
+            rand = rng.choice(rest_pool, size=min(n_rand, len(rest_pool)), replace=False)
+            sel = np.concatenate([top, rand])
+        else:
+            sel = np.arange(n)
+
+        # Convert each selected source row to a Configuration + normalized array,
+        # dropping any non-finite rows (defensive).
+        train_configs, X_list, y_list = [], [], []
+        for i in sel:
+            kv = {cols[j]: knobs_mat[i, j] for j in range(len(cols))}
+            c = self._knob_values_to_configuration(kv)
+            arr = c.get_array()
+            if np.isfinite(arr).all() and np.isfinite(tps[i]):
+                train_configs.append(c)
+                X_list.append(arr)
+                y_list.append(float(tps[i]))
+        if len(y_list) < 5:
+            return None, None
+        X_train = np.asarray(X_list, dtype=float)
+        y_train = np.asarray(y_list, dtype=float)
+
+        try:
+            kernel = (ConstantKernel(1.0, (1e-2, 1e3))
+                      * Matern(length_scale=1.0, length_scale_bounds=(1e-2, 1e2), nu=2.5)
+                      + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-5, 1e5)))
+            gp = GaussianProcessRegressor(kernel=kernel, normalize_y=True,
+                                          n_restarts_optimizer=1, random_state=0)
+            gp.fit(X_train, y_train)
+        except Exception as e:
+            logger.warning("DML GP fit failed (%s); falling back to best-tried config", e)
+            return None, None
+
+        # Candidate pool: random samples across the space (novel configs) + the
+        # context's tried configs (so we never recommend worse than best-tried
+        # in GP terms) + the default config.
+        cands = self.config_space.sample_configuration(self.gp_n_candidates)
+        if not isinstance(cands, list):
+            cands = [cands]
+        cands.extend(train_configs)
+        cands.append(self.config_space.get_default_configuration())
+        X_cand = np.asarray([c.get_array() for c in cands], dtype=float)
+
+        mu = gp.predict(X_cand)
+        best_i = int(np.argmax(mu))
+        return cands[best_i], float(mu[best_i])
+
+    def _recommend_via_ottertune(self, context_id, history_container):
+        """OtterTune-style downstream for the SAME matched source context.
+
+        Differs from _recommend_via_gp only in the downstream optimizer:
+          - trains the GP on the source context's (config->TPS) rows
+            CONCATENATED with the target's observed point(s) (as OtterTune's
+            WorkloadMapping does), and
+          - recommends by maximizing Expected Improvement (EI) — exploration,
+            like OtterTune's BO acquisition — rather than argmax of the mean.
+
+        This isolates the effect of the source-selection step: DML's embedding
+        picks the source, but the recommendation mechanics match OtterTune.
+        Returns (Configuration, predicted_tps) or (None, None) for fallback.
+        """
+        from scipy.stats import norm
+        data = self.context_rows.get(context_id)
+        if not data or len(data['tps']) < 5:
+            return None, None
+        knobs_mat, cols, tps = data['knobs'], data['cols'], data['tps']
+        n = len(tps)
+
+        rng = np.random.RandomState(0)
+        if n > self.gp_max_train:
+            order = np.argsort(tps)[::-1]
+            n_top = self.gp_max_train // 2
+            sel = np.concatenate([order[:n_top],
+                                  rng.choice(order[n_top:],
+                                             size=min(self.gp_max_train - n_top, n - n_top),
+                                             replace=False)])
+        else:
+            sel = np.arange(n)
+
+        train_configs, X_list, y_list = [], [], []
+        for i in sel:
+            kv = {cols[j]: knobs_mat[i, j] for j in range(len(cols))}
+            c = self._knob_values_to_configuration(kv)
+            arr = c.get_array()
+            if np.isfinite(arr).all() and np.isfinite(tps[i]):
+                train_configs.append(c); X_list.append(arr); y_list.append(float(tps[i]))
+        if len(y_list) < 5:
+            return None, None
+
+        # Concatenate the target's observed point(s) — OtterTune builds its
+        # surrogate on target + mapped source data.
+        if history_container is not None and history_container.configurations:
+            ems = history_container.external_metrics or []
+            for k, cfg in enumerate(history_container.configurations):
+                t = None
+                if k < len(ems) and isinstance(ems[k], dict):
+                    t = ems[k].get('tps')
+                if t is None:
+                    continue
+                arr = cfg.get_array()
+                if np.isfinite(arr).all() and np.isfinite(t):
+                    X_list.append(arr); y_list.append(float(t))
+
+        X = np.asarray(X_list, dtype=float)
+        y = np.asarray(y_list, dtype=float)
+
+        try:
+            kernel = (ConstantKernel(1.0, (1e-2, 1e3))
+                      * Matern(length_scale=1.0, length_scale_bounds=(1e-2, 1e2), nu=2.5)
+                      + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-5, 1e5)))
+            gp = GaussianProcessRegressor(kernel=kernel, normalize_y=True,
+                                          n_restarts_optimizer=1, random_state=0)
+            gp.fit(X, y)
+        except Exception as e:
+            logger.warning("DML OtterTune-downstream GP fit failed (%s); falling back", e)
+            return None, None
+
+        # Expected Improvement over candidates (maximizing TPS).
+        f_best = float(np.max(y))
+        cands = self.config_space.sample_configuration(self.gp_n_candidates)
+        if not isinstance(cands, list):
+            cands = [cands]
+        cands.extend(train_configs)
+        cands.append(self.config_space.get_default_configuration())
+        X_cand = np.asarray([c.get_array() for c in cands], dtype=float)
+
+        mu, sigma = gp.predict(X_cand, return_std=True)
+        sigma = np.clip(sigma, 1e-9, None)
+        z = (mu - f_best) / sigma
+        ei = (mu - f_best) * norm.cdf(z) + sigma * norm.pdf(z)
+        best_i = int(np.argmax(ei))
+        logger.info("DML OtterTune-downstream: EI-best predicted TPS=%.2f (f_best=%.2f)",
+                    float(mu[best_i]), f_best)
+        return cands[best_i], float(mu[best_i])
 
     def _knob_values_to_configuration(self, knob_values):
         """
@@ -272,18 +453,58 @@ class DML_Optimizer:
                     self.matched_context_id = context_id
                     break
 
+            # Manual override: FORCE_SOURCE_CONTEXT pins the source context (for
+            # sensitivity analysis — does the source choice change the result?).
+            forced = os.environ.get('FORCE_SOURCE_CONTEXT')
+            if forced:
+                import re
+                def _compact(c):
+                    return re.sub(r'_\d+-\d+-\d+-oltp_', '_', c.replace('history_', ''))
+                cands = [c for c in self.context_rows if _compact(c) == forced] \
+                        or [c for c in self.context_rows if forced in _compact(c)]
+                if cands:
+                    cands.sort(key=lambda c: ('1000000' not in c, c))  # prefer 1M table size
+                    logger.info("DML FORCED source context: %s -> %s (was %s)",
+                                forced, cands[0], self.matched_context_id)
+                    self.matched_context_id = cands[0]
+                else:
+                    logger.warning("DML FORCE_SOURCE_CONTEXT=%s matched no context; using %s",
+                                   forced, self.matched_context_id)
+
             if self.matched_context_id is None:
                 logger.warning("No matching context found, returning random config")
                 return self.config_space.sample_configuration()
 
-            # Get best config from matched context
-            best = self.best_configs[self.matched_context_id]
-            self.transferred_config = self._knob_values_to_configuration(best['knobs'])
+            best = self.best_configs.get(self.matched_context_id, {'tps': float('nan')})
+            try:
+                dist = distances[self.context_ids.index(self.matched_context_id)]
+            except ValueError:
+                dist = float('nan')  # forced context may not be in the embedding reference set
+            logger.info("DML matched context: %s (best-tried TPS=%.2f, distance=%.4f)",
+                        self.matched_context_id, best['tps'], dist)
 
-            logger.info("DML matched context: %s (TPS=%.2f, distance=%.4f)",
-                        self.matched_context_id, best['tps'],
-                        distances[self.context_ids.index(self.matched_context_id)])
-            logger.info("Transferred config: %s", dict(self.transferred_config))
+            # Downstream recommendation on the matched context. Selectable via
+            # DML_DOWNSTREAM env: 'gp' (default; GP argmax-mean on source data)
+            # or 'ottertune' (GP on target+source + EI, mirroring OtterTune) —
+            # lets us isolate the effect of source selection vs downstream.
+            downstream = os.environ.get('DML_DOWNSTREAM', 'gp').lower()
+            if downstream == 'ottertune':
+                rec_config, pred_tps = self._recommend_via_ottertune(
+                    self.matched_context_id, history_container)
+                tag = 'OtterTune-downstream'
+            else:
+                rec_config, pred_tps = self._recommend_via_gp(self.matched_context_id)
+                tag = 'GP'
+            if rec_config is not None:
+                self.transferred_config = rec_config
+                logger.info("DML %s recommendation: predicted TPS=%.2f (best-tried in context=%.2f)",
+                            tag, pred_tps, best['tps'])
+                logger.info("Transferred config (%s): %s", tag, dict(self.transferred_config))
+            else:
+                # Fallback: transfer the best config actually tried in the context
+                self.transferred_config = self._knob_values_to_configuration(best['knobs'])
+                logger.info("DML GP unavailable; transferred best-tried config: %s",
+                            dict(self.transferred_config))
 
             return self.transferred_config
 

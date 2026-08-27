@@ -80,6 +80,30 @@ class MysqlDB:
 
         # MySQL Internal Metrics
         self.num_metrics = 65
+        # Canonical 65 INNODB_METRICS names (alphabetical) shared with the OpAdviser
+        # source histories. MySQL 8.0.44 enables a superset (~74); we project the
+        # collected metrics onto exactly these 65 in this order so target IM vectors
+        # align dimensionally with the source pool. (scripts/DBTune_history/TRASH/
+        # innodb_metrics_65.txt)
+        self.canonical_im_names = [
+            'buffer_pool_bytes_data', 'buffer_pool_bytes_dirty', 'buffer_pool_pages_data', 'buffer_pool_pages_dirty',
+            'buffer_pool_pages_free', 'buffer_pool_pages_misc', 'buffer_pool_pages_total', 'buffer_pool_read_requests',
+            'buffer_pool_reads', 'buffer_pool_size', 'dml_deletes', 'dml_inserts',
+            'dml_reads', 'dml_updates', 'file_num_open_files', 'ibuf_free_list',
+            'ibuf_merges', 'ibuf_merged_delete_marks', 'ibuf_merged_deletes', 'ibuf_merged_inserts',
+            'ibuf_merges_insert', 'ibuf_merges_delete_mark', 'ibuf_merges_delete', 'ibuf_segment_leaf',
+            'ibuf_segment_non_leaf', 'ibuf_size', 'innodb_adaptive_hash_searches', 'innodb_adaptive_hash_searches_btree',
+            'innodb_buffer_pool_dump_status', 'innodb_buffer_pool_load_status', 'innodb_buffer_pool_resize_status', 'innodb_dblwr_pages_written',
+            'innodb_dblwr_writes', 'innodb_log_waits', 'innodb_os_log_fsyncs', 'innodb_os_log_pending_fsyncs',
+            'innodb_os_log_pending_writes', 'innodb_os_log_written', 'innodb_page_size', 'innodb_pages_created',
+            'innodb_pages_read', 'innodb_pages_written', 'innodb_row_lock_time', 'innodb_row_lock_time_avg',
+            'innodb_row_lock_time_max', 'innodb_rows_deleted', 'innodb_rows_inserted', 'innodb_rows_read',
+            'innodb_rows_updated', 'lock_deadlocks', 'lock_number_of_waits', 'lock_object_lock_created',
+            'lock_object_lock_requests', 'lock_rec_lock_created', 'lock_rec_lock_requests', 'lock_row_lock_time',
+            'lock_row_lock_time_avg', 'lock_row_lock_time_max', 'lock_table_lock_created', 'lock_table_lock_requests',
+            'lock_timeouts', 'trx_commits_insert_update', 'trx_id_counter', 'trx_rseg_history_len',
+            'trx_rw_commits',
+        ]
         self.value_type_metrics = [
             'lock_deadlocks', 'lock_timeouts', 'lock_row_lock_time_max',
             'lock_row_lock_time_avg', 'buffer_pool_size', 'buffer_pool_pages_total',
@@ -132,7 +156,7 @@ class MysqlDB:
                 continue
             cnf_parser.set(key, knobs[key])
     
-        cnf_parser.replace('./tmp/mysqld.cnf')
+        cnf_parser.replace(os.environ.get('DBTUNE_TMP_CNF', './tmp/mysqld.cnf'))
 
         if self.remote_mode:
             ssh = paramiko.SSHClient()
@@ -295,18 +319,33 @@ class MysqlDB:
         """
         try:
             db_conn = MysqlConnector(**self.connection_info)
+            # Knobs MySQL silently clamps/rounds away from the requested default
+            # (chunk-size rounding, system fd limit) — comparing them is meaningless.
+            clamp_skip = {'innodb_buffer_pool_size', 'open_files_limit', 'innodb_open_files'}
+
+            def _vals_match(cur, exp):
+                cur, exp = str(cur).strip(), str(exp).strip()
+                normalize = {'ON': '1', 'OFF': '0'}
+                if normalize.get(cur, cur).lower() == normalize.get(exp, exp).lower():
+                    return True            # case-insensitive / ON-OFF / exact string
+                try:
+                    c, e = float(cur), float(exp)
+                    # tolerate float formatting (75.000000==75), huge-int precision
+                    # loss, and MySQL's rounding to multiples (≤5% relative).
+                    return c == e or abs(c - e) <= 0.05 * max(abs(c), abs(e), 1.0)
+                except ValueError:
+                    return False
+
             mismatches = []
             for knob_name, detail in self.knobs_detail.items():
+                if knob_name in clamp_skip:
+                    continue
                 sql = 'SHOW GLOBAL VARIABLES LIKE "{}";'.format(knob_name)
                 result = db_conn.fetch_results(sql)
                 if result:
                     current = str(result[0]['Value']).strip()
                     expected = str(detail['default'])
-                    # Normalize MySQL boolean display (ON/OFF) to 1/0
-                    normalize = {'ON': '1', 'OFF': '0'}
-                    current_norm = normalize.get(current, current)
-                    expected_norm = normalize.get(expected, expected)
-                    if current_norm != expected_norm:
+                    if not _vals_match(current, expected):
                         mismatches.append((knob_name, current, expected))
             db_conn.close_db()
 
@@ -385,6 +424,28 @@ class MysqlDB:
             r2 = db_conn.fetch_results(sql2)
             file_num = r2[0]['Value'].strip()
             self.pre_combine_log_file_size = int(file_num) * int(file_size)
+
+            # --- Config verification: intended (DBTune) vs actual (MySQL) ---
+            # Logs one parseable line per knob so we can confirm the applied
+            # configuration matches what DBTune intended for each iteration.
+            for k in sorted(knobs.keys()):
+                try:
+                    rr = db_conn.fetch_results('SHOW GLOBAL VARIABLES LIKE "{}";'.format(k))
+                    raw = rr[0]['Value'] if rr else None
+                except Exception as e:
+                    raw = 'ERR:{}'.format(e)
+                # Normalize ON/OFF to 1/0 for comparison with enum knob values
+                actual = raw
+                if raw == 'ON':
+                    actual = '1'
+                elif raw == 'OFF':
+                    actual = '0'
+                intended = str(knobs[k])
+                match = (str(actual).strip() == intended.strip())
+                logger.info('[KNOB-VERIFY] %s intended=%s actual=%s match=%s',
+                            k, intended, raw, match)
+            # --- end config verification ---
+
             if len(knobs_rdsL) > 0:
                 tmp_rds = {}
                 for knob_rds in knobs_rdsL:
@@ -508,9 +569,12 @@ class MysqlDB:
             else:
                 return float(sum(metric_values)) / len(metric_values)
 
-        keys = list(metrics[0].keys())
-        result = np.zeros(len(keys))
-        keys.sort()
+        # Project onto the canonical 65 names (in order) so the vector aligns with
+        # the OpAdviser source pool regardless of how many metrics the server enables.
+        # Names absent on this server stay 0; extra enabled metrics are ignored.
+        keys = [k for k in self.canonical_im_names if k in metrics[0]]
+        result = np.zeros(len(self.canonical_im_names))
+        idx_of = {name: i for i, name in enumerate(self.canonical_im_names)}
         total_pages = 0
         dirty_pages = 0
         request = 0
@@ -518,26 +582,26 @@ class MysqlDB:
         page_data = 0
         page_size = 0
         page_misc = 0
-        for idx in range(len(keys)):
-            key = keys[idx]
+        for key in keys:
+            pos = idx_of[key]
             data = [x[key] for x in metrics]
-            result[idx] = do(key, data)
+            result[pos] = do(key, data)
             if key == 'buffer_pool_pages_total':
-                total_pages = result[idx]
+                total_pages = result[pos]
             elif key == 'buffer_pool_pages_dirty':
-                dirty_pages = result[idx]
+                dirty_pages = result[pos]
             elif key == 'buffer_pool_read_requests':
-                request = result[idx]
+                request = result[pos]
             elif key == 'buffer_pool_reads':
-                reads = result[idx]
+                reads = result[pos]
             elif key == 'buffer_pool_pages_data':
-                page_data = result[idx]
+                page_data = result[pos]
             elif key == 'innodb_page_size':
-                page_size = result[idx]
+                page_size = result[pos]
             elif key == 'buffer_pool_pages_misc':
-                page_misc = result[idx]
-        dirty_pages_per = dirty_pages / total_pages
-        hit_ratio = request / float(request + reads)
+                page_misc = result[pos]
+        dirty_pages_per = dirty_pages / total_pages if total_pages else 0.0
+        hit_ratio = request / float(request + reads) if (request + reads) else 0.0
         page_data = (page_data + page_misc) * page_size / (1024.0 * 1024.0 * 1024.0)
 
         return result, dirty_pages_per, hit_ratio, page_data

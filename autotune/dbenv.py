@@ -188,6 +188,17 @@ class DBEnv:
                                               BENCHMARK_RUNNING_TIME,
                                               filename,
                                               self.db.dbname)
+            # per-ini workload knobs: pbsdsh strips exported env vars, so these
+            # settings must travel in the config file, not the job environment
+            zipfian_exp = str(self.args.get('sysbench_zipfian_exp', '')).strip()
+            if zipfian_exp:
+                cmd = 'SYSBENCH_ZIPFIAN_EXP=%s %s' % (zipfian_exp, cmd)
+            rand_type = str(self.args.get('sysbench_rand_type', '')).strip()
+            if rand_type:
+                cmd = 'SYSBENCH_RAND_TYPE=%s %s' % (rand_type, cmd)
+            extra_args = str(self.args.get('sysbench_extra_args', '')).strip()
+            if extra_args:
+                cmd = "SYSBENCH_EXTRA_ARGS='%s' %s" % (extra_args, cmd)
         elif self.workload['name'] == 'oltpbench':
             filename = filename.split('/')[-1].split('.')[0]
             cmd = self.workload['cmd'].format(dirname + '/cli/run_oltpbench.sh',

@@ -76,6 +76,20 @@ def build_surrogate(func_str='gp', config_space=None, rng=None, history_hpo_data
             return WorkloadMapping(config_space, history_hpo_data, seed,
                                    surrogate_type=inner_surrogate_type, num_src_hpo_trial=-1,
                                    mapping_method='ottertune', prune_metrics=prune_metrics)
+        elif 'dmlmap' in func_str:
+            # DML embedding source-selection + OtterTune downstream (surrogate+BO/EI)
+            from autotune.transfer.tlbo.workload_map import WorkloadMapping
+            inner_surrogate_type = func_str.split('_')[-1]
+            return WorkloadMapping(config_space, history_hpo_data, seed,
+                                   surrogate_type=inner_surrogate_type, num_src_hpo_trial=-1,
+                                   mapping_method='dml')
+        elif 'rfmap' in func_str:
+            # RandomForest source-selection + OtterTune downstream (surrogate+BO/EI)
+            from autotune.transfer.tlbo.workload_map import WorkloadMapping
+            inner_surrogate_type = func_str.split('_')[-1]
+            return WorkloadMapping(config_space, history_hpo_data, seed,
+                                   surrogate_type=inner_surrogate_type, num_src_hpo_trial=-1,
+                                   mapping_method='rf')
         elif 'mapping' in func_str:
             from autotune.transfer.tlbo.workload_map import WorkloadMapping
             inner_surrogate_type = func_str.split('_')[-1]
