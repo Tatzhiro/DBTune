@@ -109,13 +109,50 @@ class MiyabiExecutor(Executor):
             active = [j for j in active if self._in_queue(j.job_id)]
 
     def _submit(self, job: Job) -> None:
+        """qsub the job -- unless a job from an earlier run of this program is still in the
+        queue for the same run dirs, in which case attach to it instead of duplicating it."""
         self.submitted.append(job)
         script = self._write_job_script(job, index=len(self.submitted))
         if self.dry_run:
             job.job_id = "dry-run"
             return
-        out = subprocess.run(["qsub", script], check=True, capture_output=True, text=True, cwd=self.root).stdout
-        job.job_id = out.strip()
+        live = self._live_job_for(job)
+        if live:
+            job.job_id = live
+            return
+        job.job_id = self._qsub(script)
+        self._record_job(job)
+
+    def _qsub(self, script: str) -> str:
+        return subprocess.run(["qsub", script], check=True, capture_output=True, text=True, cwd=self.root).stdout.strip()
+
+    # ---- job registry: survives a restart of this program ------------------------------
+    @property
+    def _registry_path(self) -> str:
+        return os.path.join(self.out_dir, "logs", "jobs.json")
+
+    def _load_registry(self) -> dict:
+        if not os.path.exists(self._registry_path):
+            return {}
+        with open(self._registry_path) as f:
+            return json.load(f)
+
+    def _record_job(self, job: Job) -> None:
+        queued = self._queued_job_ids()
+        registry = {jid: dirs for jid, dirs in self._load_registry().items() if jid in queued}
+        registry[job.job_id] = [r.dir for r in job.runs]
+        os.makedirs(os.path.dirname(self._registry_path), exist_ok=True)
+        with open(self._registry_path, "w") as f:
+            json.dump(registry, f, indent=1)
+
+    def _live_job_for(self, job: Job) -> str | None:
+        """Id of a still-queued/running job that already covers any of this job's run dirs."""
+        queued = self._queued_job_ids()
+        wanted = {r.dir for r in job.runs}
+        for jid, dirs in self._load_registry().items():
+            if jid in queued and wanted & set(dirs):
+                return jid
+        return None
 
     def _write_job_script(self, job: Job, index: int) -> str:
         template = open(os.path.join(self.root, "scripts", "lab", "prepare", "job_template.sh")).read()
@@ -130,10 +167,15 @@ class MiyabiExecutor(Executor):
             f.write(script)
         return path
 
+    def _in_queue(self, job_id: str) -> bool:
+        return job_id in self._queued_job_ids()
+
     @staticmethod
-    def _in_queue(job_id: str) -> bool:
+    def _queued_job_ids() -> set:
+        """Ids (as printed by qsub, e.g. 123456.opbs) of this user's jobs still in the queue."""
         out = subprocess.run(["qstat", "-a"], capture_output=True, text=True).stdout
-        return any(line.startswith(job_id.split(".")[0]) for line in out.splitlines())
+        return {line.split()[0] + ".opbs" if "." not in line.split()[0] else line.split()[0]
+                for line in out.splitlines() if line[:1].isdigit()}
 
     # ---- collect -------------------------------------------------------------------------
     def _collect(self, run: Run):

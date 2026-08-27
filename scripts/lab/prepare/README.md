@@ -27,7 +27,9 @@ submitted first, independent methods are prepared concurrently, and Bisection su
 all active (parameter, direction) probes of a round together.
 
 Resume: results are cached under `<out_dir>/task_cache/` by task content; re-running the
-same config skips finished work.
+same config skips finished work. On Miyabi, submitted job ids are kept in
+`<out_dir>/logs/jobs.json`; a restarted program attaches to jobs still in the queue
+instead of submitting duplicates. Run the program under `nohup`/`tmux` on the login node.
 
 Tests: `venv/bin/python -m unittest discover -s tests/prepare -t .`
 

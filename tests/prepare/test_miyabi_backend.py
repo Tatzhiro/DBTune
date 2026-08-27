@@ -69,6 +69,30 @@ class MiyabiDryRunTests(unittest.TestCase):
         self.assertIn("pbsdsh -n", script)
         self.assertIn(runs[0].dir, script)
 
+    def test_rerun_attaches_to_a_job_still_in_the_queue(self):
+        """A restarted program must not qsub a duplicate for run dirs a live job already covers."""
+        w = Workload.make("sysbench", rows=800000, threads=128, zipf=0.7)
+        first = MiyabiExecutor(root=ROOT, out_dir=self.tmp.name, dry_run=False, cache=ResultCache(None))
+        first._qsub = lambda script: "424242.opbs"
+        first._queued_job_ids = lambda: set()
+        job = first._pack([first._materialize(TuneTask(w))])[0]
+        first._submit(job)
+        self.assertEqual(job.job_id, "424242.opbs")
+
+        second = MiyabiExecutor(root=ROOT, out_dir=self.tmp.name, dry_run=False, cache=ResultCache(None))
+        second._qsub = lambda script: self.fail("must not resubmit while the job is queued")
+        second._queued_job_ids = lambda: {"424242.opbs"}
+        job2 = second._pack([second._materialize(TuneTask(w))])[0]
+        second._submit(job2)
+        self.assertEqual(job2.job_id, "424242.opbs")           # attached, not duplicated
+
+        third = MiyabiExecutor(root=ROOT, out_dir=self.tmp.name, dry_run=False, cache=ResultCache(None))
+        third._qsub = lambda script: "424300.opbs"
+        third._queued_job_ids = lambda: set()                   # old job finished -> resubmit is fine
+        job3 = third._pack([third._materialize(TuneTask(w))])[0]
+        third._submit(job3)
+        self.assertEqual(job3.job_id, "424300.opbs")
+
     def test_tpcc_is_refused_until_runner_exists(self):
         with self.assertRaises(NotImplementedError):
             self.ex._materialize(TuneTask(Workload.make("tpcc", warehouses=100, threads=32, write_ratio=0.88, skew=0.7)))
