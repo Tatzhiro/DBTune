@@ -9,4 +9,5 @@ train_user_*.py
 *.res
 *.png
 scripts/log/
-.vscode/prepare_runs/
+.vscode/
+prepare_runs/
