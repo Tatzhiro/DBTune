@@ -56,7 +56,8 @@ class MiyabiExecutor(Executor):
 
     @classmethod
     def from_config(cls, cfg: dict, out_dir: str, cache: ResultCache) -> "MiyabiExecutor":
-        return cls(out_dir=out_dir, cache=cache, **cfg)
+        kwargs = {k: v for k, v in cfg.items() if k != "type"}      # "type" selects the backend
+        return cls(out_dir=out_dir, cache=cache, **kwargs)
 
     # ---- Executor API -------------------------------------------------------------------
     def _run(self, tasks: list) -> list:
