@@ -174,6 +174,16 @@ at most one chunk tail. Same config generators, same knob file: overall success 
 config-caused rate — genuinely startup-breaking knob values, tolerated deliberately since
 failures are cheap and only good configs matter for transplant.
 
+**Correction (2026-08-29) — one bogus FAILED row per chunk restart.** `DBEnv.step_GP` ran
+`ensure_default_config(strong=True)` on the first step of every *process*, assuming it is the
+default configuration; on a resumed chunk that step is an arbitrary suggestion, the check
+raised, and the never-evaluated config was stored as FAILED. Every round-2 cell shows exactly
+(chunks − 1) such rows (S2: 3/4/3, S3: 1/2/1, S4: 4/7/2 for lhs/llama/random; S4-llama's 125
+failures include 7 of these). Pools are unaffected (FAILED rows are filtered) and the
+"config-caused" failure rates above are overstated by ≤ 6 %; LlamaTune's inner BO received one
+corrupt "failed" label per chunk. Fixed in `dbenv.py` (`_knobs_are_default` guard) on
+2026-08-29; runs before that date carry the artifact.
+
 **Why LlamaTune improved the most in S2–S4 (an effect of the fix, not of LlamaTune).**
 LlamaTune was hit hardest by round 1's streaks, for a strategy-specific reason: lhs and
 random play back schedules fixed in advance, so environmental failures only cost them
@@ -299,6 +309,42 @@ deterministic ~19.3k floor by minute 7. Combined (full OpAdviser) = replay's flo
 the space+BO tail never exceeded the replayed incumbents within the hour, though s43's
 21.6k here suggests it eventually could with a longer budget. Mechanism split at 1 h:
 replay ≈ guaranteed 97% of optimum; space-only ≈ 34% median with a long upside tail.
+
+## Results — reproduction run of the 1 h-deadline comparison (run 2, 2026-08-27/28)
+
+Re-ran four arms (ottertune / rgpe / opadviser_ns / opadviser; cold omitted) with the recipe
+in [`claude_memory/REPRO_1H_DEADLINE.md`](../claude_memory/REPRO_1H_DEADLINE.md): same scripts,
+byte-identical inis, same `pool_ALL`, snapshot and seeds. PBS job 3088190, nodes mc057–mc060,
+22:25–01:40 JST, ~13 node-h. The July histories/logs/inis are preserved under
+`*/eval2_run1_2026-07/`; `scripts/report_eval2.py --hist-dir` reads them.
+
+| arm | best@60min per seed (42/43/44) | mean | median | July mean |
+|-----|-------------------------------|------|--------|-----------|
+| **opadviser** | 14840 / 16218 / 15649 | **15,569** | 15,649 | 19,344 |
+| ottertune | 1676 / 9523 / 1596 | 4,265 | 1,676 | 6,249 |
+| rgpe | 1686 / 7633 / 1587 | 3,635 | 1,686 | 3,246 |
+| opadviser_ns | 1631 / 1693 / 1844 | 1,723 | 1,693 | 11,713 |
+
+**F7c — the failure reproduces; two caveats from the critique are now observed directly.**
+
+- Same shape as July: the three surrogate-route arms end the hour at a 1.6–1.7k *median*,
+  ~9× below the replay arm, which again exceeded 10k on its first replayed configuration
+  (iteration 1, ~minute 7) on every seed. The seed still decides the outcome: OT
+  1.6k / 9.5k / 1.6k, RGPE 1.6k / 7.6k / 1.6k. OT again selected S4-lhs (`ps30-0.7-lhs`)
+  over the S0 pools (now ranked #2/#3, distance 18.2 vs 17.4) — oracle test failed again.
+- **Shared seeds: the first 3 iterations are byte-identical across ottertune / rgpe /
+  opadviser_ns in every seed.** The seed-43 lift of OT and RGPE comes from the same shared
+  candidate stream, not from either transfer method. The arms are not independent
+  samples — never count the design as 3 seeds × 4 arms = 12 observations.
+- **Cluster-wide throughput was 22–60 % lower than on Jul 7 for identical configurations.**
+  Default config: 138–245 → 76–112 tps on all four nodes. OpAdviser's replayed source-best
+  configs — iterations 1–4 identical to July's on all three seeds — 19.5k → 12.1k / 10.8k /
+  14.8k (one config, three measurements). This is why every arm, including the replay
+  floor (19.3k → 15.6k), sits below July. **Absolute tps is not comparable across
+  runs/days; compare arms within a run, or normalise by a within-run reference config.**
+- July's opadviser_ns 21,640 outlier did not recur: the space-only ablation stayed in the
+  1.6–1.8k band on all seeds (its July mean of 11.7k was one lucky seed).
+- FAILED iterations: 1 per arm (July 0–5); 7–10 iterations per session (July 7–12).
 
 ## Status (2026-06-28)
 - Implementation complete; offline + smoke + pilot all green. First phase (S0+S1) ran:

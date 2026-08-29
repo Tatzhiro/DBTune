@@ -13,6 +13,7 @@ and `README.md` at the repo root. **Always place new notes / markdown docs in `c
 - [`claude_memory/MIYABI.md`](claude_memory/MIYABI.md) — Miyabi-C cluster facts/gotchas.
 - [`claude_memory/COLLECTION.md`](claude_memory/COLLECTION.md) — source sample collection campaign (sweep/LHS/random/LlamaTune × S0/S1, warm-start study).
 - [`claude_memory/KNOB_CURATION.md`](claude_memory/KNOB_CURATION.md) — how `mysql_perf_8.0.json` (117 perf knobs, conservative curation) was derived from `mysql_all_8.0.json`.
+- [`claude_memory/REPRO_1H_DEADLINE.md`](claude_memory/REPRO_1H_DEADLINE.md) — exact command chain, per-arm inis, outputs and caveats for the 1 h-deadline transfer-method comparison (the measured "automatic tuning is slow / luck-dependent / surrogate transfer converts nothing" result; scripts `scripts/lab/transfer_*`, `build_pool_all.py`, `report_eval2.py`).
 
 ## Entry Point
 ```
@@ -178,6 +179,11 @@ Key settings:
 - `dml_model_path` / `dml_context_metrics_path` = (dml mapping) embedding `.pth` + reference-context CSV
 - `sysbench_zipfian_exp` = (optional, `[database]`) zipfian skew for sysbench, env-prefixed onto the benchmark cmd (`run_sysbench.sh` default is 0.2; pbsdsh strips exported env vars, so set it in the ini)
 - `sampler_method` / `sweep_levels` = (Sampler only) sweep | lhs | random, sweep levels per integer knob (default 5)
+- `graceful_shutdown` = (`[database]`, offline mode) **True (default)**: between trials MySQL is stopped with
+  `innodb_fast_shutdown=1` + `mysqladmin shutdown` (dirty pages flushed at shutdown, `innodb_buffer_pool_dump_at_shutdown`
+  forced OFF so no page preload at the next start) → next start ~6–10 s. `False` restores the historical `kill -9`
+  (crash recovery of 118–282 s at every start; what all sessions before 2026-08-29 used — see
+  [REPRO_1H_DEADLINE.md §10](claude_memory/REPRO_1H_DEADLINE.md)). Falls back to kill -9 after 180 s.
 
 ## Adding a New Optimizer
 To add a new optimization method:

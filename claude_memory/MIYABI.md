@@ -100,3 +100,9 @@ breaks. So the native release binaries live under `tools/` (see SETUP.md §3.3).
   (5 GB → 48 MB) restart hypothesis was **disproven** — a standalone test
   (`scripts/test_restart_slowdown.sh`) showed that restart adds only ~33 s (30 s shutdown + 3 s
   startup). The real bottleneck is elsewhere (likely Lustre I/O latency during warmup/recovery).
+- **Throughput differs by tens of percent between days/node sets for identical configs.**
+  The 1 h-deadline wave re-run on 2026-08-27 (mc057–060) measured the default config at
+  76–112 tps vs 138–245 on 2026-07-07 (mc024/184/185/186), and OpAdviser's identical replayed
+  source-best configs at 10.8–14.8k vs 18.9–19.5k (−22…−60 %), consistently on all four
+  nodes. Never compare absolute tps across runs/days; compare arms within one wave or
+  normalise by a within-run reference config (exp_notes F7c).
