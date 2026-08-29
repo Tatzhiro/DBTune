@@ -2,21 +2,24 @@
 # Run ONE transfer-method arm (3 seeds sequentially) on THIS node, each seed a
 # fresh 1 h hard-deadline tuning session on the target workload.
 #
-#   usage: transfer_node_run.sh <root> <mode:ottertune|rgpe|opadviser|cold>
+#   usage: transfer_node_run.sh <root> <mode:ottertune|rgpe|opadviser|opadviser_ns|cold> [variant:offline|online]
+#   variant online = dynamic knobs only, SET GLOBAL without restarts, pool_S0_llama_online source,
+#   task/log prefix eval3_ (see transfer_gen_task.py)
 #
 # Per seed: fresh history (timed sessions never resume), fresh datadir from the
 # snapshot, default-config reset, metrics stack, `timeout 3600 optimize.py`.
 # rc=124 (deadline hit) is the EXPECTED outcome; rc=0 means max_runs finished early.
 # Per-iteration wall-clock offsets are recorded in the history ('update_time').
 set -uo pipefail
-ROOT="$1"; MODE="$2"
+ROOT="$1"; MODE="$2"; VARIANT="${3:-offline}"
+case "${VARIANT}" in online) PREFIX="eval3" ;; fast) PREFIX="eval4" ;; *) PREFIX="eval2" ;; esac
 DEADLINE_S="${TRANSFER_DEADLINE_S:-3600}"
 SNAP="${ROOT}/mysql_build/data_150x800k"
-NTAG="eval2_${MODE}"
+NTAG="${PREFIX}_${MODE}"
 LOG="${ROOT}/logs/parallel/${NTAG}.log"
 mkdir -p "${ROOT}/logs/parallel"
 exec >>"${LOG}" 2>&1
-echo "[${NTAG}] node=$(hostname) start=$(date -Iseconds) deadline=${DEADLINE_S}s"
+echo "[${NTAG}] node=$(hostname) start=$(date -Iseconds) deadline=${DEADLINE_S}s variant=${VARIANT}"
 
 export USER="${USER:-$(id -un)}"
 export HOME="${HOME:-/home/${USER}}"
@@ -46,7 +49,7 @@ trap cleanup EXIT INT TERM
 
 overall=0
 for seed in 42 43 44; do
-    TASK="$(python3 "${ROOT}/scripts/lab/transfer_gen_task.py" "${MODE}" "${seed}" "${ROOT}")" \
+    TASK="$(python3 "${ROOT}/scripts/lab/transfer_gen_task.py" "${MODE}" "${seed}" "${ROOT}" "${VARIANT}")" \
         || { echo "[${NTAG}] gen_task failed seed=${seed}"; overall=1; continue; }
     PARAL="${ROOT}/parallel/${TASK}"
     # timed session: always start fresh (resume would corrupt the timing record)

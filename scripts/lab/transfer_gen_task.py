@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """Generate the per-run ini + isolated cnf for one transfer-method comparison run.
 
-usage: transfer_gen_task.py <mode:ottertune|rgpe|opadviser|cold> <seed> <root>
+usage: transfer_gen_task.py <mode:ottertune|rgpe|opadviser|opadviser_ns|cold> <seed> <root> [variant]
+
+variant (default 'offline') = the original eval2 setup: 117-knob mysql_perf_8.0.json,
+my.cnf + restart per iteration with the historical kill -9 (graceful_shutdown = False pinned),
+source repo pool_ALL, task_id eval2_<mode>_s<seed>.
+variant 'fast' = identical, but with the clean shutdown that is now the default
+(innodb_fast_shutdown=1 + mysqladmin shutdown, REPRO §10), task_id eval4_<mode>_s<seed>.
+variant 'online' = the dynamic-knob replication: 95-knob mysql_perf_8.0_online.json,
+online_mode=True (SET GLOBAL, no restarts), source repo pool_S0_llama_online (the
+online-collected S0 LlamaTune cell), task_id eval3_<mode>_s<seed>.
 
 All arms tune the TARGET workload (150x800k, 128 threads, zipf 0.7) under a 1 h
 hard deadline (enforced externally via `timeout`), max_runs=200 so time binds.
@@ -19,8 +28,10 @@ S0-S4 x lhs/random/llama, SUCCESS-only) — each method selects on its own.
 import configparser, os, sys
 
 mode, seed, root = sys.argv[1], sys.argv[2], sys.argv[3]
+variant = sys.argv[4] if len(sys.argv) > 4 else 'offline'
+assert variant in ('offline', 'online', 'fast'), variant
 assert mode in ('ottertune', 'rgpe', 'opadviser', 'opadviser_ns', 'cold'), mode
-task_id = 'eval2_%s_s%s' % (mode, seed)
+task_id = '%s_%s_s%s' % ({'offline': 'eval2', 'online': 'eval3', 'fast': 'eval4'}[variant], mode, seed)
 
 paral = os.path.join(root, 'parallel', task_id)
 os.makedirs(paral, exist_ok=True)
@@ -46,6 +57,14 @@ tune['initial_runs'] = '1'
 tune['space_transfer'] = 'None'
 tune['data_repo'] = './DBTune_history/pool_ALL'
 tune['transfer_framework'] = 'none'
+if variant == 'offline':
+    db['graceful_shutdown'] = 'False'   # the July/run-2 sessions used kill -9
+if variant == 'online':
+    # 93 dynamic knobs; innodb_buffer_pool_size / innodb_redo_log_capacity are pinned at their
+    # defaults in the cnf (their online resize is a multi-minute blocking operation, REPRO §9a)
+    db['knob_config_file'] = './experiment/gen_knobs/mysql_perf_8.0_online_noresize.json'
+    db['online_mode'] = 'True'
+    tune['data_repo'] = './DBTune_history/pool_S0_llama_online'
 
 if mode == 'ottertune':
     tune['transfer_framework'] = 'workload_map'
@@ -76,6 +95,11 @@ for line in open(os.path.join(root, 'mysql_build/cnf/my.cnf.clean')):
     elif k == 'pid-file':  out.append('pid-file = /tmp/dbtune.pid')
     elif k == 'log-error': out.append('log-error = /tmp/dbtune.err')
     else:                  out.append(line.rstrip('\n'))
+if variant == 'online':
+    import json
+    _K = json.load(open(os.path.join(root, 'scripts/experiment/gen_knobs/mysql_perf_8.0_online.json')))
+    for k in ('innodb_buffer_pool_size', 'innodb_redo_log_capacity'):
+        out.append('%s = %s' % (k, _K[k]['default']))
 with open(cnf + '.clean', 'w') as f:
     f.write('\n'.join(out) + '\n')
 

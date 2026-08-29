@@ -16,7 +16,7 @@ set -uo pipefail
 ROOT="$(pwd)"
 MODE="${MODE:?qsub -v MODE=rgpe|opadviser|ottertune|cold}"
 SNAP="${ROOT}/mysql_build/data_150x800k"
-TASK="eval2smoke_${MODE}"
+TASK="eval2smoke_${MODE}${GRACEFUL:+_graceful}"   # qsub -v MODE=cold,GRACEFUL=1 -> clean-shutdown variant
 PARAL="${ROOT}/parallel/${TASK}"
 HIST="${ROOT}/scripts/DBTune_history/history_${TASK}.json"
 
@@ -50,6 +50,7 @@ sed -e "s/^task_id = .*/task_id = ${TASK}/" -e "s/^max_runs = .*/max_runs = 3/" 
     "${ROOT}/parallel/${GEN}/config.ini" > "${PARAL}/config.ini"
 sed "s#${ROOT}/parallel/${GEN}#${PARAL}#g" \
     "${ROOT}/parallel/${GEN}/my.cnf.clean" > "${PARAL}/my.cnf.clean"
+[[ "${GRACEFUL:-}" == "1" ]] && sed -i "s/^\[database\]$/[database]\ngraceful_shutdown = True/" "${PARAL}/config.ini"
 rm -f "${HIST}"
 
 rm -rf "${PARAL}/data"

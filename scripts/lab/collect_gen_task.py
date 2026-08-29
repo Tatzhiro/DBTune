@@ -35,6 +35,13 @@ for line in open(src_clean):
     elif k == 'pid-file':  out.append('pid-file = /tmp/dbtune.pid')
     elif k == 'log-error': out.append('log-error = /tmp/dbtune.err')
     else:                  out.append(line.rstrip('\n'))
+# pinned server settings for this cell ([database] cnf_extra = k=v;k=v), e.g. the two
+# async-resize knobs held at their defaults in the online (no-resize) variant
+_c0 = configparser.ConfigParser(); _c0.optionxform = str; _c0.read(base_cfg)
+for kv in (_c0['database'].get('cnf_extra', '') or '').split(';'):
+    if kv.strip():
+        k, v = kv.split('=', 1)
+        out.append(f'{k.strip()} = {v.strip()}')
 with open(cnf + '.clean', 'w') as f:
     f.write('\n'.join(out) + '\n')
 
