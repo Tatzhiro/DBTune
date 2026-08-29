@@ -7,6 +7,8 @@
 # kind=tune : LlamaTune collection on the task's workload (optimize.py, online knobs)
 # kind=eval : Sampler[replay] of the task's configs on the workload
 # Resume-safe: a complete history exits at once; a partial one continues.
+# Tune/Eval run in chunks (default 4 h) with a fresh datadir copy each chunk, so a
+# restart-failure streak (sticky redo/recovery state) costs at most one chunk tail.
 set -uo pipefail
 ROOT="$1"; RUN="$2"
 SPEC="${RUN}/task.json"
@@ -54,22 +56,45 @@ if [[ "${KIND}" == "prep" ]]; then
 fi
 
 WANT="$(python3 -c "import configparser;c=configparser.ConfigParser();c.optionxform=str;c.read('${RUN}/config.ini');print(c['tune']['max_runs'])")"
-have=$(python3 -c "import json;print(len(json.load(open('${HIST}'))['data']))" 2>/dev/null || echo 0)
-if (( have >= WANT )); then echo "[${TASK_ID}] already complete (${have}/${WANT})"; exit 0; fi
+MIN_OK="$(python3 -c "import configparser;c=configparser.ConfigParser();c.optionxform=str;c.read('${RUN}/config.ini');print(c['tune'].get('min_success', 0))")"
+CHUNK_S="${PREP_CHUNK_S:-14400}"     # fresh datadir every 4 h: a restart-failure streak costs at most one chunk tail
+
+state() {   # echoes "<rows> <successes>"
+    python3 - "${HIST}" <<'PY'
+import json, os, sys
+fn = sys.argv[1]
+if not os.path.exists(fn):
+    print('0 0'); raise SystemExit
+d = json.load(open(fn))['data']
+print(len(d), sum(1 for r in d if r['trial_state'] == 0))
+PY
+}
+complete() {   # done when the attempt cap is reached or (tune only) enough successes exist
+    read -r rows ok <<< "$(state)"
+    (( rows >= WANT )) || { (( MIN_OK > 0 )) && (( ok >= MIN_OK )); }
+}
+
 [[ -d "${SNAP}" ]] || { echo "[${TASK_ID}] snapshot ${SNAP} missing"; exit 1; }
+while :; do
+    read -r rows ok <<< "$(state)"
+    echo "[${TASK_ID}] state: ${rows}/${WANT} rows, ${ok} ok (min_success=${MIN_OK})"
+    if complete; then echo "[${TASK_ID}] complete"; exit 0; fi
+    remaining=$(( TIMEOUT_S - SECONDS ))
+    if (( remaining < 900 )); then echo "[${TASK_ID}] out of time (${rows}/${WANT} rows)"; exit 124; fi
+    this_chunk=$(( remaining < CHUNK_S ? remaining : CHUNK_S ))
 
-echo "[${TASK_ID}] fresh datadir from $(basename "${SNAP}") ..."; t0=$(date +%s)
-bash "${ROOT}/scripts/lab/stop_stack.sh" 2>/dev/null || true
-pkill -x mysqld 2>/dev/null || true; sleep 3
-rm -rf "${RUN}/data"
-cp -a "${SNAP}" "${RUN}/data" || { echo "[${TASK_ID}] datadir copy failed"; exit 1; }
-echo "[${TASK_ID}] copied in $(( $(date +%s) - t0 ))s"
-bash "${ROOT}/scripts/lab/reset_database.sh" "${RUN}/config.ini" || { echo "[${TASK_ID}] reset failed"; exit 1; }
-bash "${ROOT}/scripts/lab/start_stack.sh" || { echo "[${TASK_ID}] metrics stack failed"; exit 1; }
+    echo "[${TASK_ID}] chunk: fresh datadir from $(basename "${SNAP}") ..."; t0=$(date +%s)
+    bash "${ROOT}/scripts/lab/stop_stack.sh" 2>/dev/null || true
+    pkill -x mysqld 2>/dev/null || true; sleep 3
+    rm -rf "${RUN}/data"
+    cp -a "${SNAP}" "${RUN}/data" || { echo "[${TASK_ID}] datadir copy failed"; exit 1; }
+    echo "[${TASK_ID}] copied in $(( $(date +%s) - t0 ))s"
+    bash "${ROOT}/scripts/lab/reset_database.sh" "${RUN}/config.ini" || { echo "[${TASK_ID}] reset failed"; exit 1; }
+    bash "${ROOT}/scripts/lab/start_stack.sh" || { echo "[${TASK_ID}] metrics stack failed"; exit 1; }
 
-( cd "${ROOT}/scripts" && timeout --signal=TERM --kill-after=120 "${TIMEOUT_S}" \
-    python optimize.py --config="${RUN}/config.ini" )
-rc=$?
-have=$(python3 -c "import json;print(len(json.load(open('${HIST}'))['data']))" 2>/dev/null || echo 0)
-echo "[${TASK_ID}] optimize.py rc=${rc} have=${have}/${WANT}"
-(( have >= WANT )) && exit 0 || exit "${rc}"
+    ( cd "${ROOT}/scripts" && timeout --signal=TERM --kill-after=120 "${this_chunk}" \
+        python optimize.py --config="${RUN}/config.ini" )
+    echo "[${TASK_ID}] chunk rc=$?"
+    # rc=0: stop rule reached inside the chunk -> loop re-checks and exits
+    # rc=124: chunk timeout -> loop continues with a fresh datadir (history resumes)
+done
