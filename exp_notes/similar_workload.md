@@ -346,6 +346,32 @@ byte-identical inis, same `pool_ALL`, snapshot and seeds. PBS job 3088190, nodes
   1.6–1.8k band on all seeds (its July mean of 11.7k was one lucky seed).
 - FAILED iterations: 1 per arm (July 0–5); 7–10 iterations per session (July 7–12).
 
+## Results — same comparison with the clean-shutdown harness (eval4, 2026-08-29 15:29–18:35)
+
+Same four arms, seeds, knobs and `pool_ALL`, but between trials MySQL is now shut down cleanly
+when the estimated dirty-page flush is cheap (default since commit `6a88e30`; details in
+[`claude_memory/REPRO_1H_DEADLINE.md`](../claude_memory/REPRO_1H_DEADLINE.md) §10–11). Job
+3208151, nodes under head mc103, ~12.4 node-h.
+
+| arm | best@60min per seed (42/43/44) | mean | median | iterations/session | run-2 mean (kill -9) |
+|-----|-------------------------------|------|--------|--------------------|----------------------|
+| **opadviser** | 20004 / 20464 / 20065 | **20,178** | 20,065 | 13 / 15 / 13 | 15,569 |
+| rgpe | 5629 / 12358 / 3289 | 7,092 | 5,629 | 14 / 13 / 11 | 3,635 |
+| opadviser_ns | 1723 / 3943 / 13942 | 6,536 | 3,943 | 13 / 14 / 12 | 1,723 |
+| ottertune | 2264 / 11157 / 3451 | 5,624 | 3,451 | 13 / 13 / 11 | 4,265 |
+
+**F7d — 1.6× more evaluations per hour does not change the picture.** Dead time per iteration
+fell from 140 s median / 196 s mean (run 2, kill -9) to **43 s median / 92 s mean** (158 clean
+shutdowns, median 15 s, p90 205 s, max 405 s; 4 kill -9 decisions by the rule; 0 budget
+fallbacks), giving 11–15 evaluations per session instead of 7–12. The surrogate-route arms still
+end the hour at a 3.5–5.6k median with seed-dominated spread (each arm's best seed is a
+different one: OT s43, RGPE s43, space-only s44), 3–6× below the replay arm, which again exceeded
+20k on every seed by minute 14–21 on its first replayed configuration. The first 3 / 6 / 3
+iterations are byte-identical across the three surrogate arms (shared seed). Absolute numbers are
+back at July level (replay floor 20.2k vs 19.3k July, 15.6k on Aug 27) — the cross-day offset is
+real and unrelated to the harness change (F7c). Failures: 2 startup-breaking configs in 158
+evaluations; no tps ≤ 0 rows.
+
 ## Status (2026-06-28)
 - Implementation complete; offline + smoke + pilot all green. First phase (S0+S1) ran:
   **all 8 cells reached 451/451** mechanically. S2–S4 not yet collected.

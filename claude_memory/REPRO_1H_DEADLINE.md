@@ -365,3 +365,16 @@ Historical kill -9 dead time after dw=ON configs: median 119–153 s, mean 178�
 clean shutdown when ≤450 s (600 s budget), else kill -9. Validated in the loop (job 3206958):
 `dirty_pages=42625 → clean, 26 s`; `dirty_pages=295425 → kill -9`. Expected per-iteration dead time
 ≈25 s for dw=OFF configs, 110–225 s (bounded) for dw=ON, vs 175–200 s mean before.
+
+### 11b. eval4 wave result (job 3208151, 2026-08-29 15:29–18:35)
+
+```
+arm                         seed 42               seed 43               seed 44     mean   median
+ottertune      2264 (n=13, t=1577s) 11157 (n=13, t=2103s)  3451 (n=11, t=2074s)     5624     3451
+rgpe           5629 (n=14, t=3572s) 12358 (n=13, t=2133s)  3289 (n=11, t=1944s)     7092     5629
+opadviser_ns   1723 (n=13, t=3341s)  3943 (n=14, t= 415s) 13942 (n=12, t=3275s)     6536     3943
+opadviser     20004 (n=13, t=1246s) 20464 (n=15, t=1271s) 20065 (n=13, t= 834s)    20178    20065
+```
+Dead time per iteration 43 s median / 92 s mean (run 2: 140 / 196); 158 clean shutdowns
+(median 15 s, p90 205 s, max 405 s), 4 kill -9 by rule, 0 budget fallbacks, 2 FAILED trials.
+Write-up: exp_notes F7d.
