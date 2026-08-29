@@ -21,7 +21,15 @@ log_size_default = 50331648
 
 RESTART_WAIT_TIME = 5
 TIMEOUT_CLOSE = 60
-GRACEFUL_CLOSE_TIMEOUT = 180   # clean-shutdown budget before falling back to kill -9 (measured worst 21 s at 13.5 GB dirty)
+GRACEFUL_CLOSE_TIMEOUT = 600   # clean-shutdown budget before falling back to kill -9
+# Clean shutdown vs kill -9, measured on Miyabi-C (Lustre datadir, scripts/lab/test_restart_policy.sh):
+#   doublewrite=OFF: 500-880k dirty pages flush in 14-21 s (~40k pages/s); kill -9 recovery 118-282 s.
+#   doublewrite=ON : flush only 1.4-2.7k pages/s (per-batch fsync) -> 300-390k pages take 111-225 s;
+#                    kill -9 recovery for the same states 169-271 s, historically up to ~600 s.
+# The flush cost is predictable from the dirty-page count, recovery is not; so shut down cleanly whenever
+# the estimated flush stays well inside the budget, and kill -9 only for pathological dirty sets.
+GRACEFUL_FLUSH_PAGES_PER_S = {'OFF': 40000.0, 'ON': 1400.0}
+GRACEFUL_MAX_EST_FLUSH_S = 450.0
 
 logging.getLogger("paramiko").setLevel(logging.ERROR)
 
@@ -220,14 +228,22 @@ class MysqlDB:
                 # loaded at the next start (kill -9 never produced one -> warm-up semantics unchanged).
                 try:
                     db_conn = MysqlConnector(**self.connection_info)
-                    db_conn.execute('SET GLOBAL innodb_fast_shutdown=1')
-                    db_conn.execute('SET GLOBAL innodb_buffer_pool_dump_at_shutdown=OFF')
+                    dw = str(db_conn.fetch_results("SHOW GLOBAL VARIABLES LIKE 'innodb_doublewrite'")[0]['Value']).strip().upper()
+                    dirty = int(db_conn.fetch_results("SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_dirty'")[0]['Value'])
+                    est = dirty / GRACEFUL_FLUSH_PAGES_PER_S.get(dw, GRACEFUL_FLUSH_PAGES_PER_S['ON'])
+                    use_clean = est <= GRACEFUL_MAX_EST_FLUSH_S
+                    logger.info('shutdown policy: doublewrite=%s dirty_pages=%d est_flush=%.0fs -> %s', dw, dirty, est,
+                                'clean shutdown' if use_clean else 'kill -9 (estimated flush exceeds %.0fs)' % GRACEFUL_MAX_EST_FLUSH_S)
+                    if use_clean:
+                        db_conn.execute('SET GLOBAL innodb_fast_shutdown=1')
+                        db_conn.execute('SET GLOBAL innodb_buffer_pool_dump_at_shutdown=OFF')
                     db_conn.close_db()
-                    p_close = subprocess.run(kill_cmd, shell=True, capture_output=True, timeout=GRACEFUL_CLOSE_TIMEOUT)
-                    closed = (p_close.returncode == 0)
-                    logger.info('graceful shutdown %s (%.1fs)',
-                                'done' if closed else 'rc=%d, falling back to kill -9' % p_close.returncode,
-                                time.time() - kill_start)
+                    if use_clean:
+                        p_close = subprocess.run(kill_cmd, shell=True, capture_output=True, timeout=GRACEFUL_CLOSE_TIMEOUT)
+                        closed = (p_close.returncode == 0)
+                        logger.info('graceful shutdown %s (%.1fs)',
+                                    'done' if closed else 'rc=%d, falling back to kill -9' % p_close.returncode,
+                                    time.time() - kill_start)
                 except subprocess.TimeoutExpired:
                     logger.info('graceful shutdown exceeded %ds; falling back to kill -9', GRACEFUL_CLOSE_TIMEOUT)
                 except Exception as e:

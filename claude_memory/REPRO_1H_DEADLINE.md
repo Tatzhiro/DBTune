@@ -345,3 +345,23 @@ python3 scripts/report_eval2.py --prefix eval4 --arms ottertune rgpe opadviser_n
 Expected: ~16 evaluations/h instead of ~11 (more BO iterations inside the same 1 h). Results are a
 new baseline (starting state per trial differs from kill -9 runs); compare arms within the wave.
 Collection inis (`config_collect_*`) also pick up the default from now on.
+
+### 11a. First `fast` wave aborted; doublewrite decides the flush cost (2026-08-29 13:24–13:44)
+
+Job 3202623 (eval4, 4 arms): with the plain clean shutdown every **doublewrite=ON** config SMAC
+explored took ≥168 s to flush (168, 178, 4 × >180 s → kill -9 fallback), doublewrite=OFF configs
+11–33 s. SMAC picks doublewrite=ON in 52 % of configs, so the naive policy was slower than kill -9
+for half of all iterations; aborted after 20 min. Follow-up micro-test (job 3204312, the two slow
+configs A/B, ~300–390 k dirty pages, `test_restart_policy.sh` with `RT_POL/RT_CFG/RT_HIST`):
+
+| config (dw=ON) | clean (fast_shutdown=1) | clean + `innodb_doublewrite=DETECT_ONLY` | kill -9 recovery |
+|---|---|---|---|
+| A (20 GB pool, io_cap 1.57M) | 111 s | 132 s, 144 s | 271 s (smoke) |
+| B (16 GB pool, flush_neighbors=0) | 214 s | 225 s | 169 s |
+
+DETECT_ONLY does not help (the per-batch fsync pattern remains; OFF cannot be set at runtime).
+Historical kill -9 dead time after dw=ON configs: median 119–153 s, mean 178–204 s, max ~595 s.
+**Rule now in `_kill_mysqld`:** estimate flush = dirty pages ÷ (40 k/s if dw=OFF, 1.4 k/s if ON);
+clean shutdown when ≤450 s (600 s budget), else kill -9. Validated in the loop (job 3206958):
+`dirty_pages=42625 → clean, 26 s`; `dirty_pages=295425 → kill -9`. Expected per-iteration dead time
+≈25 s for dw=OFF configs, 110–225 s (bounded) for dw=ON, vs 175–200 s mean before.

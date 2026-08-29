@@ -179,11 +179,11 @@ Key settings:
 - `dml_model_path` / `dml_context_metrics_path` = (dml mapping) embedding `.pth` + reference-context CSV
 - `sysbench_zipfian_exp` = (optional, `[database]`) zipfian skew for sysbench, env-prefixed onto the benchmark cmd (`run_sysbench.sh` default is 0.2; pbsdsh strips exported env vars, so set it in the ini)
 - `sampler_method` / `sweep_levels` = (Sampler only) sweep | lhs | random, sweep levels per integer knob (default 5)
-- `graceful_shutdown` = (`[database]`, offline mode) **True (default)**: between trials MySQL is stopped with
-  `innodb_fast_shutdown=1` + `mysqladmin shutdown` (dirty pages flushed at shutdown, `innodb_buffer_pool_dump_at_shutdown`
-  forced OFF so no page preload at the next start) → next start ~6–10 s. `False` restores the historical `kill -9`
-  (crash recovery of 118–282 s at every start; what all sessions before 2026-08-29 used — see
-  [REPRO_1H_DEADLINE.md §10](claude_memory/REPRO_1H_DEADLINE.md)). Falls back to kill -9 after 180 s.
+- `graceful_shutdown` = (`[database]`, offline mode) **True (default)**: between trials MySQL is stopped with a clean
+  shutdown (`innodb_fast_shutdown=1` + `mysqladmin shutdown`, buffer-pool dump forced OFF) **when the estimated dirty-page
+  flush is ≤450 s** (dirty pages ÷ 40k/s with doublewrite OFF, ÷ 1.4k/s with doublewrite ON — Lustre-measured rates);
+  otherwise, and on a 600 s timeout, the historical `kill -9`. Clean start ≈ 6–10 s vs 118–282 s of crash recovery
+  after kill -9. `False` = always kill -9 (all sessions before 2026-08-29). Details: [REPRO_1H_DEADLINE.md §10–11](claude_memory/REPRO_1H_DEADLINE.md).
 
 ## Adding a New Optimizer
 To add a new optimization method:

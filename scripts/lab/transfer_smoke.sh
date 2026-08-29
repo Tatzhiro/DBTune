@@ -50,7 +50,10 @@ sed -e "s/^task_id = .*/task_id = ${TASK}/" -e "s/^max_runs = .*/max_runs = 3/" 
     "${ROOT}/parallel/${GEN}/config.ini" > "${PARAL}/config.ini"
 sed "s#${ROOT}/parallel/${GEN}#${PARAL}#g" \
     "${ROOT}/parallel/${GEN}/my.cnf.clean" > "${PARAL}/my.cnf.clean"
-[[ "${GRACEFUL:-}" == "1" ]] && sed -i "s/^\[database\]$/[database]\ngraceful_shutdown = True/" "${PARAL}/config.ini"
+if [[ "${GRACEFUL:-}" == "1" ]]; then   # the offline variant pins graceful_shutdown = False; flip it
+    sed -i "/^graceful_shutdown = /d" "${PARAL}/config.ini"
+    sed -i "s/^\[database\]$/[database]\ngraceful_shutdown = True/" "${PARAL}/config.ini"
+fi
 rm -f "${HIST}"
 
 rm -rf "${PARAL}/data"

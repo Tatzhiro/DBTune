@@ -15,11 +15,15 @@
 #   c (config): 3 real top-tps S0 configs (26/5 GB, 23.7/2.6 GB, 15.1/5.5 GB pool/redo)
 #   order: v = K9 G1 G2 K9 G1 G2 K9 G1 G2 ; c = 1 2 3 2 3 1 3 1 2  (each startup config follows
 #   each shutdown policy once).  Buffer-pool dump/load pinned OFF for all variants.
+# Overrides (qsub -v, ';'-separated): RT_POL='G1;D1;K9' RT_CFG='cA;cA;cB' RT_HIST=<history json> RT_ROWS='1;2'
+#   -> configs cA,cB,... are rows of RT_HIST; policy D1 = SET innodb_doublewrite=DETECT_ONLY, then G1
+#   (doublewrite page-content writes are what makes the clean flush slow on Lustre for dw=ON configs).
 # Outputs: parallel/restart_test/results.csv, errlog_<cycle>_{start,stop}.txt, sb_<cycle>.log
 set -uo pipefail
 [[ -n "${PBS_O_WORKDIR:-}" ]] && cd "${PBS_O_WORKDIR}"
 ROOT="$(pwd)"; T="${ROOT}/parallel/restart_test"; SNAP="${ROOT}/mysql_build/data_150x800k"
 export PATH="${ROOT}/sysbench_install/bin:${ROOT}/mysql_build/bin:${PATH}"
+export RT_HIST RT_ROWS 2>/dev/null || true
 export LD_LIBRARY_PATH="${ROOT}/mysql_build/lib:${LD_LIBRARY_PATH:-}"
 export SYSBENCH_BIN="${ROOT}/sysbench_install/bin/sysbench" MYSQL_SOCK="/tmp/dbtune.sock" SYSBENCH_ZIPFIAN_EXP=0.7
 MYSQLD="${ROOT}/mysql_build/bin/mysqld"; MYSQL="${ROOT}/mysql_build/bin/mysql -uroot -S /tmp/dbtune.sock"
@@ -42,12 +46,16 @@ lhs = json.load(open(os.path.join(root, 'scripts/eval/replay_S0_lhs.json')))
 rnd = json.load(open(os.path.join(root, 'scripts/eval/replay_S0_random.json')))
 cfgs = [('c1', lhs['configs'][0], lhs['source_tps'][0]), ('c2', rnd['configs'][0], rnd['source_tps'][0]),
         ('c3', rnd['configs'][2], rnd['source_tps'][2])]
+if os.environ.get('RT_HIST'):
+    rows = json.load(open(os.path.join(root, os.environ['RT_HIST'])))['data']
+    cfgs = [('c' + chr(ord('A') + i), rows[int(r)]['configuration'], rows[int(r)]['external_metrics']['tps'])
+            for i, r in enumerate(os.environ['RT_ROWS'].split(';'))]
 for name, c, tps in cfgs:
     lines = base + ['%s = %s' % (k, ("'%s'" % v if isinstance(v, str) and ' ' in v else v)) for k, v in c.items() if k in K]
     open(os.path.join(T, name + '.cnf'), 'w').write('\n'.join(lines) + '\n')
     print('[RT] %s: source tps %.0f, pool %.1f GB, redo %.1f GB, flush_trx %s, dirty_pct %s, io_cap %s' % (
         name, tps, c['innodb_buffer_pool_size'] / 2**30, c['innodb_log_file_size'] * c.get('innodb_log_files_in_group', 1) / 2**30,
-        c['innodb_flush_log_at_trx_commit'], c.get('innodb_max_dirty_pages_pct'), c.get('innodb_io_capacity')))
+        c['innodb_flush_log_at_trx_commit'], c.get('innodb_max_dirty_pages_pct'), c.get('innodb_io_capacity')), 'dw=%s' % c.get('innodb_doublewrite'))
 PY
 
 echo "[RT] copying snapshot ..."; t0=$(date +%s); rm -rf "${T}/data"; cp -a "${SNAP}" "${T}/data" || { echo "[RT] copy failed"; exit 1; }
@@ -72,6 +80,10 @@ stop_mysqld() {  # $1 = policy ; prints seconds until no mysqld process, and whe
     local m; m=$(errmark); local t0; t0=$(date +%s.%N); local fallback=0
     case "$1" in
         K9) pkill -9 -x mysqld ;;
+        D1) ${MYSQL} -e "SET GLOBAL innodb_doublewrite='DETECT_ONLY'" 2>&1 | sed 's/^/[RT]   dw->DETECT_ONLY: /' >&2
+            ${MYSQL} -N -e "SELECT @@innodb_doublewrite" 2>&1 | sed 's/^/[RT]   dw now: /' >&2
+            ${MYSQL} -e "SET GLOBAL innodb_fast_shutdown=1" 2>/dev/null
+            timeout 600 ${MYSQLADMIN} shutdown 2>/dev/null || { fallback=1; pkill -9 -x mysqld; } ;;
         G1|G2) ${MYSQL} -e "SET GLOBAL innodb_fast_shutdown=${1#G}" 2>/dev/null
                timeout 600 ${MYSQLADMIN} shutdown 2>/dev/null || { fallback=1; pkill -9 -x mysqld; } ;;
     esac
@@ -82,7 +94,8 @@ stop_mysqld() {  # $1 = policy ; prints seconds until no mysqld process, and whe
 }
 
 echo "cycle,start_cnf,prev_policy,startup_s,tps,dirty_pages,checkpoint_age_bytes,pool_mb,policy,shutdown_s,fallback_kill9" > "${RES}"
-POL=(K9 G1 G2 K9 G1 G2 K9 G1 G2); CFG=(c1 c2 c3 c2 c3 c1 c3 c1 c2); prev="snapshot"
+IFS=";" read -ra POL <<< "${RT_POL:-K9;G1;G2;K9;G1;G2;K9;G1;G2}"; IFS=";" read -ra CFG <<< "${RT_CFG:-c1;c2;c3;c2;c3;c1;c3;c1;c2}"; prev="snapshot"
+echo "[RT] plan: policies=${POL[*]} configs=${CFG[*]}"
 for i in "${!POL[@]}"; do
     CYC=$((i+1)); v="${POL[$i]}"; c="${CFG[$i]}"
     echo "[RT] cycle ${CYC}: start ${c} (after ${prev}) $(date -Iseconds)"
