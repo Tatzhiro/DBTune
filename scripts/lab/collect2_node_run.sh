@@ -39,6 +39,14 @@ mkdir -p "${STACK_LOG_DIR}"
 source "${ROOT}/venv/bin/activate"
 rm -f "${PARAL}/.rc"
 
+tmp_probe() {  # node-local /tmp is 14 GB; log usage + biggest entries so exhaustion is attributable
+    echo "[${TAG}] tmp-probe $(date -Iseconds): $(df -h /tmp | awk 'NR==2{print $3" used / "$2", "$5}')"
+    du -sh /tmp/dbtune.err /tmp/dbtune_stack "${TMPDIR:-/tmp}"/prom-data-* /tmp/*.err 2>/dev/null | sort -h | tail -4 | sed "s/^/[${TAG}] tmp-probe   /"
+    find /tmp -xdev -type f -size +300M 2>/dev/null | head -5 | xargs -r du -sh 2>/dev/null | sed "s/^/[${TAG}] tmp-probe   big: /"
+}
+( while sleep 3600; do tmp_probe; done ) &
+PROBE_PID=$!
+
 # task_id from the ini (histories are keyed by it)
 TASK_ID="$(python3 -c "
 import configparser; c=configparser.ConfigParser(); c.optionxform=str
@@ -58,6 +66,7 @@ PY
 
 cleanup() {
     local rc=$?
+    kill "${PROBE_PID}" 2>/dev/null || true
     bash "${ROOT}/scripts/lab/stop_stack.sh" 2>/dev/null || true
     "${ROOT}/mysql_build/bin/mysqladmin" -uroot -S "${MYSQL_SOCK}" shutdown 2>/dev/null || true
     pkill -x mysqld 2>/dev/null || true
@@ -85,6 +94,7 @@ while :; do
     this_chunk=$(( remaining - 900 < CHUNK_S ? remaining - 900 : CHUNK_S ))
 
     echo "[${TAG}] chunk start ($(date -Iseconds)), timeout ${this_chunk}s: fresh datadir ..."
+    tmp_probe
     bash "${ROOT}/scripts/lab/stop_stack.sh" 2>/dev/null || true
     pkill -x mysqld 2>/dev/null || true; sleep 3
     rm -rf "${PARAL}/data"

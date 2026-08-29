@@ -225,7 +225,12 @@ class DBEnv:
 
     def get_states(self, collect_resource=0):
         # start Internal Metrics Collection
-        internal_metrics = Manager().list()
+        # one Manager per DBEnv: a fresh Manager() per iteration is never shut down, so its
+        # server process + /tmp listener socket leak until the process can no longer spawn
+        # one (collect_S0_llama_online: 'Process SyncManager-67 ... No space left on device')
+        if getattr(self, '_mp_manager', None) is None:
+            self._mp_manager = Manager()
+        internal_metrics = self._mp_manager.list()
         im = mp.Process(target=self.db.get_internal_metrics,
                         args=(internal_metrics, BENCHMARK_RUNNING_TIME, BENCHMARK_WARMING_TIME))
         self.db.set_im_alive(True)
@@ -322,6 +327,26 @@ class DBEnv:
             raise Exception('Apply knobs failed!')
 
 
+    def _knobs_are_default(self, knobs):
+        """True when every knob equals its knob-file default (ON/OFF~1/0, case-insensitive,
+        numeric tolerance) — i.e. this is the iteration-0 default configuration."""
+        def norm(v):
+            t = str(v).strip().lower()
+            return {'on': '1', 'off': '0'}.get(t, t)
+        for k, v in knobs.items():
+            d = self.knobs_detail.get(k, {}).get('default') if isinstance(self.knobs_detail.get(k), dict) else None
+            if d is None:
+                continue
+            if norm(v) == norm(d):
+                continue
+            try:
+                if abs(float(v) - float(d)) <= 1e-6 * max(1.0, abs(float(d))):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            return False
+        return True
+
     def step_GP(self, knobs, collect_resource=True):
         #return False, np.random.rand(6), np.random.rand(65), np.random.rand(8)
         # re-init database if activated
@@ -352,8 +377,11 @@ class DBEnv:
         else:
             flag = self.db.apply_knobs_offline(knobs)
 
-        # After first iteration applies knobs, verify they took effect
-        if self.step_count == 1:
+        # After the first iteration of a FRESH session (= the default config) verify it took
+        # effect. On a RESUMED session step 1 is an arbitrary suggested config: skip the check
+        # (it raised on every chunk restart of the collection runners and recorded a config
+        # that never ran as FAILED, feeding a corrupt label to the optimizer).
+        if self.step_count == 1 and self._knobs_are_default(knobs):
             self.db.ensure_default_config()
 
         if not flag:

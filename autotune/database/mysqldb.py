@@ -21,6 +21,7 @@ log_size_default = 50331648
 
 RESTART_WAIT_TIME = 5
 TIMEOUT_CLOSE = 60
+GRACEFUL_CLOSE_TIMEOUT = 180   # clean-shutdown budget before falling back to kill -9 (measured worst 21 s at 13.5 GB dirty)
 
 logging.getLogger("paramiko").setLevel(logging.ERROR)
 
@@ -57,6 +58,10 @@ class MysqlDB:
                 except Exception:
                     pass
         self.mycnf = args['cnf']
+        # clean shutdown between trials (innodb_fast_shutdown=1 + mysqladmin shutdown) is the default;
+        # [database] graceful_shutdown = False restores the historical kill -9 (crash recovery at every
+        # start; needed to reproduce the eval2 sessions byte-for-byte)
+        self.graceful_shutdown = str(args.get('graceful_shutdown', 'True')).strip().lower() != 'false'
         self.mysqld = args['mysqld']
 
         # remote information
@@ -206,7 +211,29 @@ class MysqlDB:
             #     if ret_code == 0:
             #         logger.info("Close db successfully (graceful, %.1fs)", time.time() - kill_start)
             # except subprocess.TimeoutExpired:
-            logger.info("Force close! (timeout after %ds, elapsed %.1fs)", TIMEOUT_CLOSE, time.time() - kill_start)
+            closed = False
+            if self.graceful_shutdown:
+                # Clean shutdown: flush dirty pages now so the next start skips crash recovery.
+                # Measured on Miyabi-C (scripts/lab/test_restart_policy.sh, 2026-08-29): kill -9 ->
+                # 118-282 s of recovery at the next start; innodb_fast_shutdown=1 -> 14-21 s here +
+                # 6-10 s there. The buffer-pool dump is disabled for this shutdown so no page list is
+                # loaded at the next start (kill -9 never produced one -> warm-up semantics unchanged).
+                try:
+                    db_conn = MysqlConnector(**self.connection_info)
+                    db_conn.execute('SET GLOBAL innodb_fast_shutdown=1')
+                    db_conn.execute('SET GLOBAL innodb_buffer_pool_dump_at_shutdown=OFF')
+                    db_conn.close_db()
+                    p_close = subprocess.run(kill_cmd, shell=True, capture_output=True, timeout=GRACEFUL_CLOSE_TIMEOUT)
+                    closed = (p_close.returncode == 0)
+                    logger.info('graceful shutdown %s (%.1fs)',
+                                'done' if closed else 'rc=%d, falling back to kill -9' % p_close.returncode,
+                                time.time() - kill_start)
+                except subprocess.TimeoutExpired:
+                    logger.info('graceful shutdown exceeded %ds; falling back to kill -9', GRACEFUL_CLOSE_TIMEOUT)
+                except Exception as e:
+                    logger.info('graceful shutdown failed (%s); falling back to kill -9', e)
+            if not closed:
+                logger.info("Force close! (timeout after %ds, elapsed %.1fs)", TIMEOUT_CLOSE, time.time() - kill_start)
             result = subprocess.run(['pgrep', '-x', 'mysqld'], capture_output=True, text=True)
             if result.stdout:
                 for pid in result.stdout.strip().split('\n'):
@@ -382,9 +409,40 @@ class MysqlDB:
 
         for key in knobs.keys():
             self.set_knob_value(db_conn, key, knobs[key])
+        self._wait_for_async_resizes(db_conn)
         db_conn.close_db()
         logger.info("[{}] Knobs applied online!".format(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         return True
+
+    def _wait_for_async_resizes(self, db_conn, max_wait=900):
+        """innodb_buffer_pool_size and innodb_redo_log_capacity are dynamic but resize
+        asynchronously: MySQL reports the new size only when the resize completes and
+        blocks page access during its critical phase. Benchmarking while a resize is in
+        flight measures the stall, not the configuration (collect_S0_llama_online rows
+        3/8: 'benchmark timeout', tps=-1 recorded as SUCCESS). Poll the status variables
+        until both report completion (capped at max_wait seconds), and log the wait."""
+        checks = {
+            'Innodb_buffer_pool_resize_status': lambda v: v == '' or 'completed' in v.lower(),
+            'Innodb_redo_log_resize_status': lambda v: v == '' or v.upper() == 'OK',
+        }
+        t0 = time.time()
+        for name, settled in checks.items():
+            while True:
+                try:
+                    r = db_conn.fetch_results("SHOW GLOBAL STATUS LIKE '{}';".format(name))
+                    v = r[0]['Value'].strip() if r else ''
+                except Exception as e:
+                    logger.info('[resize-wait] %s: status query failed (%s); not waiting', name, e)
+                    break
+                if settled(v):
+                    break
+                if time.time() - t0 > max_wait:
+                    logger.info('[resize-wait] %s still "%s" after %d s; proceeding', name, v, max_wait)
+                    break
+                time.sleep(5)
+        waited = time.time() - t0
+        if waited >= 1:
+            logger.info('[resize-wait] async resizes settled after %.0f s', waited)
 
     def apply_knobs_offline(self, knobs):
         # modify cnf and restart db

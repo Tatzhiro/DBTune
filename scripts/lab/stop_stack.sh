@@ -16,4 +16,11 @@ for proc in mysqld_exporter node_exporter prometheus; do
     # Catch any strays
     pkill -x "${proc}" 2>/dev/null || true
 done
+# drop the Prometheus TSDB this stack wrote (node-local /tmp is 14 GB; a long job
+# with several chunks must not accumulate one TSDB per chunk)
+if [[ -f "${STACK_LOG_DIR}/tsdb.path" ]]; then
+    tsdb="$(cat "${STACK_LOG_DIR}/tsdb.path")"
+    [[ -n "${tsdb}" && -d "${tsdb}" && "${tsdb}" == *prom-data-* ]] && rm -rf "${tsdb}"
+    rm -f "${STACK_LOG_DIR}/tsdb.path"
+fi
 echo "[OK] stack stopped"
