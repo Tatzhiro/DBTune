@@ -33,6 +33,26 @@ class ExecutorTests(unittest.TestCase):
         res = ex.run_all([EvalTask(w, interleave([cfg], 3))])[0]
         self.assertEqual(len(res.tps), 3)
 
+    def test_task_in_flight_in_another_batch_is_joined_not_rerun(self):
+        """Two threads asking for the same task while one batch is running -> one run."""
+        started, release = threading.Event(), threading.Event()
+
+        class SlowSim(type(make_sim())):
+            def _run(self, tasks):
+                started.set(); release.wait(timeout=10)
+                return super()._run(tasks)
+
+        ex = SlowSim(make_sim().surface)
+        w = Workload.make("sysbench", rows=500, threads=64)
+        results = []
+        t1 = threading.Thread(target=lambda: results.append(ex.run_all([TuneTask(w)])[0]))
+        t1.start(); started.wait(timeout=10)
+        t2 = threading.Thread(target=lambda: results.append(ex.run_all([TuneTask(w)])[0]))
+        t2.start(); release.set()
+        t1.join(timeout=10); t2.join(timeout=10)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(ex.tune_calls, 1)
+
     def test_concurrent_waiters(self):
         ex = make_sim()
         results = {}

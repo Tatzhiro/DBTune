@@ -99,8 +99,11 @@ class MiyabiExecutor(Executor):
         return [Job(runs[i:i + self.max_nodes]) for i in range(0, len(runs), self.max_nodes)]
 
     def _execute(self, jobs: list[Job]) -> None:
-        """Submit up to max_jobs at a time; poll until every job has left the queue."""
-        pending, active = list(jobs), []
+        """Submit up to max_jobs at a time; poll until every job has left the queue.
+        Runs already covered by a job that an earlier run of this program left in the
+        queue are attached to that job instead of being submitted again."""
+        attached, fresh = self._split_by_live_jobs([r for j in jobs for r in j.runs])
+        pending, active = self._pack(fresh), list(attached)
         while pending or active:
             while pending and len(active) < self.max_jobs:
                 job = pending.pop(0)
@@ -111,17 +114,24 @@ class MiyabiExecutor(Executor):
             time.sleep(self.poll_s)
             active = [j for j in active if self._in_queue(j.job_id)]
 
+    def _split_by_live_jobs(self, runs: list) -> tuple[list[Job], list]:
+        """(jobs to attach to, runs still to submit)."""
+        queued = self._queued_job_ids()
+        live = {jid: set(dirs) for jid, dirs in self._load_registry().items() if jid in queued}
+        attached, fresh = {}, []
+        for run in runs:
+            owner = next((jid for jid, dirs in live.items() if run.dir in dirs), None)
+            if owner:
+                attached.setdefault(owner, Job([], owner)).runs.append(run)
+            else:
+                fresh.append(run)
+        return list(attached.values()), fresh
+
     def _submit(self, job: Job) -> None:
-        """qsub the job -- unless a job from an earlier run of this program is still in the
-        queue for the same run dirs, in which case attach to it instead of duplicating it."""
         self.submitted.append(job)
         script = self._write_job_script(job, index=len(self.submitted))
         if self.dry_run:
             job.job_id = "dry-run"
-            return
-        live = self._live_job_for(job)
-        if live:
-            job.job_id = live
             return
         job.job_id = self._qsub(script)
         self._record_job(job)
@@ -147,15 +157,6 @@ class MiyabiExecutor(Executor):
         os.makedirs(os.path.dirname(self._registry_path), exist_ok=True)
         with open(self._registry_path, "w") as f:
             json.dump(registry, f, indent=1)
-
-    def _live_job_for(self, job: Job) -> str | None:
-        """Id of a still-queued/running job that already covers any of this job's run dirs."""
-        queued = self._queued_job_ids()
-        wanted = {r.dir for r in job.runs}
-        for jid, dirs in self._load_registry().items():
-            if jid in queued and wanted & set(dirs):
-                return jid
-        return None
 
     def _write_job_script(self, job: Job, index: int) -> str:
         template = open(os.path.join(self.root, "scripts", "lab", "prepare", "job_template.sh")).read()

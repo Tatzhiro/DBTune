@@ -54,6 +54,7 @@ class Executor(ABC):
     def __init__(self, cache: ResultCache | None = None):
         self.cache = cache or ResultCache(None)
         self._pending: dict[str, tuple[object, list[Future]]] = {}
+        self._inflight: dict[str, list[Future]] = {}      # key -> futures, while a batch runs
         self._lock = threading.Condition()
 
     def submit(self, task) -> Future:
@@ -63,7 +64,10 @@ class Executor(ABC):
             _resolve(future, cached)
             return future
         with self._lock:
-            self._pending.setdefault(task.key(), (task, []))[1].append(future)
+            if task.key() in self._inflight:                  # already running in another batch: join it
+                self._inflight[task.key()].append(future)
+            else:
+                self._pending.setdefault(task.key(), (task, []))[1].append(future)
         return future
 
     def wait(self, futures: Iterable[Future]) -> list:
@@ -81,15 +85,17 @@ class Executor(ABC):
     def flush(self) -> None:
         """Run everything pending (as one batch) and resolve its futures."""
         with self._lock:
-            batch = list(self._pending.values())
+            batch = list(self._pending.items())
             self._pending = {}
+            for key, (task, futures) in batch:
+                self._inflight[key] = futures
         if not batch:
             return
-        results = self._run([task for task, _ in batch])
+        results = self._run([task for _, (task, _) in batch])
         with self._lock:
-            for (task, futures), result in zip(batch, results):
+            for (key, (task, _)), result in zip(batch, results):
                 self.cache.put(task, result)
-                for f in futures:
+                for f in self._inflight.pop(key):
                     _resolve(f, result)
             self._lock.notify_all()
 
