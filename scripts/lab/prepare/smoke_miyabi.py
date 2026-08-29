@@ -19,7 +19,7 @@ from autotune.prepare.tasks import EvalTask, TuneBudget, TuneTask, interleave  #
 
 def main(config_path: str) -> None:
     cfg = load_config(config_path)
-    out_dir = os.path.join(cfg.get("out_dir", "prepare_runs/run"), "smoke")
+    out_dir = os.path.abspath(os.path.join(cfg.get("out_dir", "prepare_runs/run"), "smoke"))
     backend = dict(cfg["backend"], tune_hours=0.4, eval_minutes_per_config=5, dry_run=False)
     ex = MiyabiExecutor.from_config(backend, out_dir, ResultCache(os.path.join(out_dir, "task_cache")))
     anchor = build_beliefs(cfg).mode_workload()

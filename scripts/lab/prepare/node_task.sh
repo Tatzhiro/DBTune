@@ -11,6 +11,8 @@
 # restart-failure streak (sticky redo/recovery state) costs at most one chunk tail.
 set -uo pipefail
 ROOT="$1"; RUN="$2"
+cd "${ROOT}" || exit 1
+[[ -f "${RUN}/task.json" ]] || { echo "node_task.sh: no task.json in ${RUN}" >&2; exit 1; }
 SPEC="${RUN}/task.json"
 field() { python3 -c "import json,sys;print(json.load(open('${SPEC}')).get('$1',''))"; }
 KIND="$(field kind)"; TASK_ID="$(field task_id)"; SNAP="${ROOT}/mysql_build/$(field snapshot)"
@@ -56,6 +58,7 @@ if [[ "${KIND}" == "prep" ]]; then
 fi
 
 WANT="$(python3 -c "import configparser;c=configparser.ConfigParser();c.optionxform=str;c.read('${RUN}/config.ini');print(c['tune']['max_runs'])")"
+[[ -n "${WANT}" ]] || { echo "[${TASK_ID}] config.ini has no [tune] max_runs"; exit 1; }
 MIN_OK="$(python3 -c "import configparser;c=configparser.ConfigParser();c.optionxform=str;c.read('${RUN}/config.ini');print(c['tune'].get('min_success', 0))")"
 CHUNK_S="${PREP_CHUNK_S:-14400}"     # fresh datadir every 4 h: a restart-failure streak costs at most one chunk tail
 

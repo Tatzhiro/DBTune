@@ -30,7 +30,7 @@ from autotune.prepare.evaluate import evaluate, submit_ground_truth, summarize  
 
 def main(config_path: str) -> None:
     cfg = load_config(config_path)
-    out_dir = cfg.get("out_dir", os.path.splitext(config_path)[0] + "_out")
+    out_dir = os.path.abspath(cfg.get("out_dir", os.path.splitext(config_path)[0] + "_out"))
     os.makedirs(out_dir, exist_ok=True)
 
     beliefs = build_beliefs(cfg)

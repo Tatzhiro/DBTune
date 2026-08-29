@@ -48,7 +48,9 @@ class MiyabiExecutor(Executor):
                  knob_file: str = "./experiment/gen_knobs/mysql_perf_8.0_online.json",
                  dry_run: bool = False, cache: ResultCache | None = None):
         super().__init__(cache)
-        self.root, self.out_dir, self.project, self.queue = root, out_dir, project, queue
+        # absolute paths everywhere: pbsdsh starts node_task.sh in a different cwd
+        self.root, self.out_dir = os.path.abspath(root), os.path.abspath(out_dir)
+        self.project, self.queue = project, queue
         self.max_nodes, self.max_jobs, self.poll_s = max_nodes, max_jobs, poll_s
         self.tune_hours, self.eval_minutes_per_config, self.prep_hours = tune_hours, eval_minutes_per_config, prep_hours
         self.online, self.knob_file, self.dry_run = online, knob_file, dry_run
