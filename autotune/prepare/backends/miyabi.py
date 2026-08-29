@@ -183,6 +183,9 @@ class MiyabiExecutor(Executor):
     # ---- collect -------------------------------------------------------------------------
     def _collect(self, run: Run):
         rows = self._history_rows(run.spec["history"])
+        if not rows and not self.dry_run:
+            raise RuntimeError("no history for %s: the job did not run its task (see %s/node.log and the job log)"
+                               % (run.spec["task_id"], run.dir))
         if isinstance(run.task, TuneTask):
             return self._tune_result(rows, run.spec["history"])
         return EvalResult(_tps_per_config(rows, len(run.task.configs)))
