@@ -9,6 +9,8 @@ import os
 from ..benchmarks import BENCHMARKS, Dataset
 from ..tasks import TuneTask
 
+MAX_CONNECTIONS = 1024     # MySQL's default 151 rejects sysbench at >150 threads
+
 LLAMATUNE = {"optimize_method": "LlamaTune", "llamatune_low_dim": "16",
              "llamatune_max_num_values": "10000", "llamatune_surrogate": "prf", "initial_runs": "10"}
 
@@ -87,6 +89,8 @@ def _write_clean_cnf(root: str, run_dir: str) -> None:
     for line in open(os.path.join(root, "mysql_build", "cnf", "my.cnf.clean")):
         key = line.split("=", 1)[0].strip()
         lines.append("%s = %s" % (key, overrides[key]) if key in overrides else line.rstrip("\n"))
+    if not any(l.split("=", 1)[0].strip() == "max_connections" for l in lines):
+        lines.append("max_connections = %d" % MAX_CONNECTIONS)   # workloads go up to 256 clients
     with open(os.path.join(run_dir, "my.cnf.clean"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
