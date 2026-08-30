@@ -336,6 +336,12 @@ class BO_Optimizer(object, metaclass=abc.ABCMeta):
             self.logger.info('Sample random config. rand_prob=%f.' % self.rand_prob)
             return self.sample_random_configs(num_configs=1, excluded_configs=history_container.configurations)[0]
 
+        if self.optimization_strategy == 'bo' and not history_container.get_incumbents():
+            # Every observation so far failed (e.g. an environment problem on the first
+            # attempts): there is no incumbent for EI, so keep sampling instead of crashing.
+            self.logger.warning('No successful observation yet; sampling a random config.')
+            return self.sample_random_configs(num_configs=1, excluded_configs=history_container.configurations)[0]
+
         if self.optimization_strategy == 'bo':
             # update acquisition function
             if self.num_objs == 1:
