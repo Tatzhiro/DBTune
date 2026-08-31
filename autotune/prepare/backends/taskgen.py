@@ -11,6 +11,11 @@ from ..tasks import TuneTask
 
 MAX_CONNECTIONS = 1024     # MySQL's default 151 rejects sysbench at >150 threads
 
+# Rows of an Eval history that are not measurements: the default config the Sampler always
+# plays first, plus WARMUP_RUNS throwaway replays of the first config (the first benchmark on a
+# freshly copied datadir reads cold from Lustre and measures 2-4x low).
+WARMUP_RUNS = 1
+
 LLAMATUNE = {"optimize_method": "LlamaTune", "llamatune_low_dim": "16",
              "llamatune_max_num_values": "10000", "llamatune_surrogate": "prf", "initial_runs": "10"}
 
@@ -76,9 +81,11 @@ def _fill_tune(tune, task, task_id: str, run_dir: str) -> None:
         tune["rand_seed"] = str(task.budget.seed)
     else:
         replay = os.path.join(run_dir, "replay.json")
-        _write_json(replay, {"source_task_id": task_id, "configs": [dict(c) for c in task.configs]})
+        played = [dict(c) for c in task.configs]
+        warmup = played[:WARMUP_RUNS]     # throwaway: the first run after a fresh datadir is cold
+        _write_json(replay, {"source_task_id": task_id, "configs": warmup + played, "warmup_runs": len(warmup)})
         tune.update({"optimize_method": "Sampler", "sampler_method": "replay", "replay_file": replay,
-                     "max_runs": str(1 + len(task.configs)), "initial_runs": "1"})
+                     "max_runs": str(1 + len(warmup) + len(played)), "initial_runs": "1"})
 
 
 def _write_clean_cnf(root: str, run_dir: str) -> None:

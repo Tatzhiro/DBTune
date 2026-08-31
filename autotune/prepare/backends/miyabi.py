@@ -87,7 +87,7 @@ class MiyabiExecutor(Executor):
         if isinstance(run.task, TuneTask):
             ok = sum(1 for r in rows if r["trial_state"] == SUCCESS)
             return ok >= run.task.budget.min_success or len(rows) >= run.task.budget.max_attempts
-        return len(rows) >= 1 + len(run.task.configs)
+        return len(rows) >= 1 + taskgen.WARMUP_RUNS + len(run.task.configs)
 
     # ---- materialize ---------------------------------------------------------------------
     def _materialize(self, task) -> Run:
@@ -228,10 +228,11 @@ class MiyabiExecutor(Executor):
         return TuneResult(dict(best["configuration"]), float(best["external_metrics"]["tps"]), len(ok), len(rows), history)
 
 
-def _tps_per_config(rows: list, n_configs: int) -> list:
-    """Row 0 is the default config the Sampler always plays first; rows 1.. follow the replay list."""
+def _tps_per_config(rows: list, n_configs: int, skip: int = 1 + taskgen.WARMUP_RUNS) -> list:
+    """Skip the default config the Sampler plays first and the throwaway warm-up run(s);
+    the next n_configs rows follow the task's config list."""
     tps = []
-    for row in rows[1:1 + n_configs]:
+    for row in rows[skip:skip + n_configs]:
         ok = row["trial_state"] == SUCCESS and row.get("external_metrics")
         tps.append(float(row["external_metrics"]["tps"]) if ok else None)
     return tps + [None] * (n_configs - len(tps))

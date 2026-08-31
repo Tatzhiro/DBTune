@@ -60,7 +60,9 @@ class MiyabiDryRunTests(unittest.TestCase):
                 self.ex._materialize(TuneTask(w)), self.ex._materialize(TuneTask(w.with_param("threads", 32))),
                 self.ex._materialize(TuneTask(w.with_param("threads", 256)))]
         replay = json.load(open(os.path.join(runs[0].dir, "replay.json")))
-        self.assertEqual(len(replay["configs"]), 3)
+        self.assertEqual(len(replay["configs"]), 4)                      # 1 warm-up + 3 measured
+        self.assertEqual(replay["warmup_runs"], 1)
+        self.assertIn("max_runs = 5", open(os.path.join(runs[0].dir, "config.ini")).read())
         jobs = self.ex._pack(runs)
         self.assertEqual([len(j.runs) for j in jobs], [3, 1])          # max_nodes = 3
         self.ex._execute(jobs)                                          # dry run: scripts only
@@ -102,7 +104,7 @@ class MiyabiDryRunTests(unittest.TestCase):
         if not os.path.exists(hist):
             self.skipTest("no S3 probe history")
         rows = json.load(open(hist))["data"]
-        tps = _tps_per_config(rows, 14)
+        tps = _tps_per_config(rows, 14, skip=1)                          # old layout: no warm-up row
         self.assertEqual(len(tps), 14)
         self.assertGreater(tps[0], 20000)                               # first replayed config on 80k rows
         result = MiyabiExecutor._tune_result(rows, hist)
