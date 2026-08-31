@@ -61,12 +61,33 @@ class MiyabiExecutor(Executor):
         kwargs = {k: v for k, v in cfg.items() if k != "type"}      # "type" selects the backend
         return cls(out_dir=out_dir, cache=cache, **kwargs)
 
+    MAX_ROUNDS = 3   # initial submission + this many resubmissions of incomplete runs
+
     # ---- Executor API -------------------------------------------------------------------
     def _run(self, tasks: list) -> list:
         runs = [self._materialize(t) for t in tasks]
         self._ensure_datasets(runs)
-        self._execute(self._pack(runs))
+        todo = list(runs)
+        for _ in range(1 + self.MAX_ROUNDS):
+            self._execute(self._pack(todo))
+            if self.dry_run:
+                break
+            todo = [r for r in todo if not self._is_complete(r)]
+            if not todo:
+                break
+        else:
+            raise RuntimeError("still incomplete after %d resubmissions: %s"
+                               % (self.MAX_ROUNDS, [r.spec["task_id"] for r in todo]))
         return [self._collect(r) for r in runs]
+
+    def _is_complete(self, run: Run) -> bool:
+        """A walltime-cut job leaves a partial history; the task must be resubmitted, not
+        collected: a partial Tune silently weakens the repository / ground truth."""
+        rows = self._history_rows(run.spec["history"])
+        if isinstance(run.task, TuneTask):
+            ok = sum(1 for r in rows if r["trial_state"] == SUCCESS)
+            return ok >= run.task.budget.min_success or len(rows) >= run.task.budget.max_attempts
+        return len(rows) >= 1 + len(run.task.configs)
 
     # ---- materialize ---------------------------------------------------------------------
     def _materialize(self, task) -> Run:

@@ -88,10 +88,16 @@ class BisectionPrepare(PrepareMethod):
                      ex: Executor, repo: Repository) -> None:
         workloads = [self._probe_workload(p, anchor.workload, beliefs) for p in active]
         tuned = tune_all(ex, workloads, self.budget, repo)                                  # parallel
-        measured = measure_many(ex, [(w, [anchor.config, tuned[w].best_config]) for w in workloads],
+        measurable = [(p, w) for p, w in zip(active, workloads) if tuned[w].best_config]
+        measured = measure_many(ex, [(w, [anchor.config, tuned[w].best_config]) for _, w in measurable],
                                 self.repeats, repo)                                          # parallel
-        for probe, w, m in zip(active, workloads, measured):
+        for (probe, w), m in zip(measurable, measured):
             self._decide(probe, w, tuned[w], m, anchor, repo)
+        for probe, w in zip(active, workloads):
+            if not tuned[w].best_config:      # every Tune attempt failed: nothing to measure
+                repo.ledger.notes.append("%s:%s probe %s: tune produced no config -> fail"
+                                         % (probe.param, probe.direction, w.label()))
+                self._register_failure(probe, w, anchor, repo)
 
     def _probe_workload(self, probe: Probe, anchor: Workload, beliefs: BeliefSet) -> Workload:
         return anchor.with_param(probe.param, beliefs.value_at(probe.param, probe.q))
@@ -109,6 +115,10 @@ class BisectionPrepare(PrepareMethod):
             self._resolve(probe, gap, repo)
             return
         add_tuned(repo, w, tuned, "probe", "ratio=%.3f" % ratio)
+        self._register_failure(probe, w, anchor, repo)
+
+    def _register_failure(self, probe: Probe, w: Workload, anchor: Entry, repo: Repository) -> None:
+        gap = abs(w.get(probe.param) - anchor.workload.get(probe.param))
         probe.failed += 1
         if probe.failed >= self.max_probes:
             self._resolve(probe, gap / 2, repo)          # conservative: half the innermost failing gap
